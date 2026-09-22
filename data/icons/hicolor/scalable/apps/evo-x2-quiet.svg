@@ -1,0 +1,23 @@
+<!--
+  Quiet (mode 0): one bar, green.
+
+  The bar count is the mode: one bar for quiet, two for balanced, three for
+  performance, four for sustained.  The colour repeats that so the mode is still
+  readable at 16 px, where counting bars is hard.
+
+  Two deliberate choices, both learned from bugs:
+
+  * No `currentColor`.  Qt's SVG parser (the one plasmashell renders tray and
+    notification icons with) does not implement it: the string is absent from
+    libqsvg.so, so every shape silently fell back to opaque black and vanished
+    against a dark panel.  Every fill here is an explicit colour.
+
+  * The colours are mid-tone on purpose, relative luminance around 0.2, which
+    clears 3:1 contrast against both a dark panel (#1b1e23) and a light one
+    (#ffffff).  A bright icon disappears on light panels, a dark one on dark.
+
+  No double hyphen may appear inside an XML comment, hence the parentheses.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <rect x="6.5" y="8" width="3" height="5" rx="1.5" fill="#1f9d5b"/>
+</svg>

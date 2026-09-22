@@ -1,0 +1,79 @@
+# The two checks a change has to survive: the unit suite, and the static checks
+# on the files that fail quietly.  The installer is the only shell in the repo,
+# and the two .desktop entries decide whether the menu item and the tray icon
+# appear at all -- a typo in either is invisible until someone logs in.
+#
+# The suite deliberately needs no hardware, no root and no session bus: the
+# embedded-controller access is exercised against a plain file standing in for
+# the debugfs node.  That is what makes it runnable here.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Ubuntu row of the dependency table in the README.  The tray speaks
+      # D-Bus, and one test module loads the GUI to exercise its tray logic, so
+      # both sets of bindings have to be importable for the suite to be whole.
+      - name: Install the GUI and D-Bus bindings
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-dbus
+
+      # Without these, test_tray cannot be imported and its tests are reported
+      # as one opaque loader error instead of as failures.  Check the stack
+      # first so a missing typelib reads as a missing typelib.
+      - name: Check the GUI stack the tray tests load
+        run: |
+          python3 -c "import dbus; print('dbus bindings OK')"
+          python3 -c "import gi; gi.require_version('Adw', '1'); from gi.repository import Adw, Gtk; print('GTK 4 + libadwaita OK')"
+
+      # -W error is what caught the unclosed files and the invalid SVG comment
+      # during development, so it stays.  PyGObject raises its own
+      # PyGIDeprecationWarning while importing the Gtk override (it still calls
+      # GLib.unix_signal_add_full internally); escalating that would fail the
+      # import of the GUI and take 52 tests with it.  A dotted -W filter cannot
+      # name a class, so the whole DeprecationWarning category is let through --
+      # every other warning still fails the build.
+      - name: Run the suite
+        run: python3 -W error -W ignore::DeprecationWarning -m unittest discover -s tests -v
+
+  lint:
+    name: Static checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install desktop-file-utils
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends desktop-file-utils
+
+      - name: Shell scripts
+        run: |
+          shellcheck install.sh uninstall.sh
+          bash -n install.sh
+          bash -n uninstall.sh
+
+      - name: Desktop entries
+        run: |
+          desktop-file-validate data/org.evox2.Control.desktop
+          desktop-file-validate data/org.evox2.Control.autostart.desktop
+
+      # The scripts in bin/ and tools/ have no .py extension, so compileall
+      # needs them named explicitly to check their syntax.
+      - name: Python syntax
+        run: |
+          python3 -m compileall -q lib gui daemon tests
+          python3 -m compileall -q bin/evo-x2-power tools/ec-probe tools/mode-report

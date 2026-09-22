@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local scratch files from testing against real hardware
+*.local.conf
+ec-dump-*.bin
+mode-*.log

@@ -1,0 +1,30 @@
+<!--
+  Application icon: the mode mark, on a badge.
+
+  This is the icon the menu entry, the window list and the task manager draw,
+  and it is *not* the same asset as the tray and notification icons: those are
+  transparent and set in the colour of the current mode, while this one carries
+  an opaque badge so the app is recognisable at a glance in a launcher.
+
+  Two rules it has to obey, both of which the first version of this file broke:
+
+  * The badge must be a *mid-tone*.  The original was a dark slate gradient
+    (#39435a to #1a1f27); against a dark panel that is 1.5:1, so the task
+    manager drew a black square with a few faint bars on it.  A mid-tone
+    clears 3:1 against a dark panel and against a white one, so one badge
+    works on both themes.
+  * Flat colours only.  Nothing here may be a gradient: Qt renders gradients
+    fine, but a flat fill is legible at 16 px and can actually be checked by
+    the tests, which read the paint attributes out of the parsed tree.
+
+  The bars stay the same three-rising-bars mark as the tray icons, because
+  that is what makes the two sets read as one product.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <rect x="6" y="6" width="116" height="116" rx="27"
+        fill="#3d8ae0" stroke="#1f6fd0" stroke-width="3"/>
+
+  <rect x="28" y="70" width="18" height="32" rx="8" fill="#eef6ff"/>
+  <rect x="55" y="50" width="18" height="52" rx="8" fill="#eef6ff"/>
+  <rect x="82" y="30" width="18" height="72" rx="8" fill="#eef6ff"/>
+</svg>

@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""
+ec-probe -- look at the embedded controller directly, and watch the thermal-mode
+button arrive.
+
+This is the tool used to work out the register map in the first place, and the
+tool to reach for when porting this project to a machine whose firmware differs.
+It needs root, because the EC debugfs node is root-only.
+
+    sudo ec-probe --dump              show the EC bytes that are not zero
+    sudo ec-probe --diff              snapshot, ask you to press the button,
+                                      snapshot again, and diff the two
+    sudo ec-probe --capture 90        poll the whole window for 90 seconds and
+                                      report every register that moves -- use
+                                      this for a button whose register you do
+                                      not know yet
+    sudo ec-probe --watch 60          report every ACPI event for 60 seconds,
+                                      with the mode before and after a press
+    sudo ec-probe --mode              just the thermal-mode byte
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import select
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                os.pardir, "lib"))
+
+import evo_x2_hw as hw  # noqa: E402
+
+PROG = "ec-probe"
+
+#: Register names recovered from the ERAX Field() list in this machine's DSDT
+#: (see docs/HOW-IT-WORKS.md).  FCMO decoding to 0x31 -- the offset this project
+#: established behaviourally -- is what makes the rest of the list trustworthy.
+#: Purely for labelling: everything here works without it.
+REGISTER_NAMES = {
+    0x04: "OSFG", 0x05: "FMFG",
+    0x17: "DLTM", 0x18: "BFLG", 0x1A: "FNLK",
+    0x31: "FCMO", 0x32: "FCMI",
+    0x33: "FAN1", 0x34: "FAN2",
+    0x35: "FN1L", 0x36: "FN1H", 0x37: "FN2L", 0x38: "FN2H",
+    0x3F: "OSD0", 0x40: "SPMF", 0x41: "LIDF",
+    0x50: "CHTF", 0x54: "MODS", 0x55: "DPXX", 0x57: "ESLP",
+    0x70: "CPUT", 0x71: "GPUT", 0x72: "CPAD", 0x73: "GPAD",
+    0x74: "PPM0", 0x75: "PPS0", 0x76: "PPM1", 0x77: "PPS1",
+    0x7F: "LIDS",
+}
+
+#: How long to wait between polls.  A full 256-byte read costs about 0.35 s of
+#: EC transactions, so this is the practical floor for a whole-window capture.
+CAPTURE_INTERVAL = 0.4
+
+#: Seconds of "get ready" before a capture starts.  Module level so a test can
+#: drop it to zero rather than sleeping for it.
+CAPTURE_COUNTDOWN = 3
+
+
+def register_label(offset: int) -> str:
+    name = REGISTER_NAMES.get(offset)
+    if offset == hw.EC_REG_MODE_READ:
+        return "FCMO (current thermal mode)"
+    if offset == hw.EC_REG_MODE_WRITE:
+        return "FCMI (mode request)"
+    return name or ""
+
+
+class TransitionLog:
+    """Every register change seen while polling, with when it happened.
+
+    A single before/after diff misses a button that only pulses a register for a
+    moment, which is why capture polls instead.  Kept separate from the I/O so
+    the bookkeeping can be tested without a controller.
+    """
+
+    def __init__(self, baseline: bytes, registers=None):
+        self.registers = list(range(256) if registers is None else registers)
+        self.baseline = baseline
+        self.current = {offset: baseline[offset] for offset in self.registers}
+        self.transitions = {}
+
+    def observe(self, sample: bytes, elapsed: float):
+        """Record changes; return the (offset, old, new) that just appeared."""
+        changed = []
+        for offset in self.registers:
+            new = sample[offset]
+            old = self.current[offset]
+            if new != old:
+                self.transitions.setdefault(offset, []).append((elapsed, old, new))
+                self.current[offset] = new
+                changed.append((offset, old, new))
+        return changed
+
+    def changed_offsets(self):
+        return sorted(self.transitions)
+
+    def values_seen(self, offset: int):
+        """The baseline value plus everything it became, in order."""
+        seen = [self.baseline[offset]]
+        seen.extend(new for _, _, new in self.transitions[offset])
+        return seen
+
+    def moments(self, offset: int):
+        return [elapsed for elapsed, _, _ in self.transitions[offset]]
+
+
+def read_region(path: str) -> bytes:
+    """The whole 256-byte EC window."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        blob = bytearray()
+        while len(blob) < 256:
+            chunk = os.read(fd, 256 - len(blob))
+            if not chunk:
+                break
+            blob.extend(chunk)
+    finally:
+        os.close(fd)
+    if len(blob) != 256:
+        raise hw.EcAccessError(f"short read: got {len(blob)} bytes, expected 256")
+    return bytes(blob)
+
+
+def describe_mode(value: int) -> str:
+    try:
+        mode = hw.mode_from_index(value)
+    except hw.ModeError:
+        return "not a known mode"
+    return f"{mode.name} ({value})"
+
+
+def cmd_mode(path: str) -> int:
+    value = hw.read_ec_byte(hw.EC_REG_MODE_READ, path)
+    print(f"EC[{hw.EC_REG_MODE_READ:#04x}] = {value:#04x}  {describe_mode(value)}")
+    value = hw.read_ec_byte(hw.EC_REG_MODE_WRITE, path)
+    print(f"EC[{hw.EC_REG_MODE_WRITE:#04x}] = {value:#04x}  (mode-request register)")
+    return 0
+
+
+def cmd_dump(path: str) -> int:
+    blob = read_region(path)
+    print(f"EC window, non-zero bytes ({path}):\n")
+    for offset in range(0, 256, 16):
+        row = blob[offset:offset + 16]
+        if not any(row):
+            continue
+        hexed = " ".join(f"{byte:02x}" for byte in row)
+        print(f"  {offset:02x}: {hexed}")
+    print()
+    print(f"  EC[{hw.EC_REG_MODE_READ:#04x}] (FCMO, current mode) = "
+          f"{blob[hw.EC_REG_MODE_READ]:#04x}  "
+          f"{describe_mode(blob[hw.EC_REG_MODE_READ])}")
+    return 0
+
+
+def diff(before: bytes, after: bytes) -> int:
+    changed = [(i, before[i], after[i]) for i in range(256) if before[i] != after[i]]
+    if not changed:
+        print("  no bytes changed")
+        return 1
+    for offset, old, new in changed:
+        note = ""
+        if offset == hw.EC_REG_MODE_READ:
+            note = "   <-- FCMO, the mode register"
+        elif offset == hw.EC_REG_MODE_WRITE:
+            note = "   <-- FCMI, the mode-request register"
+        print(f"  EC[{offset:#04x}]: {old:#04x} -> {new:#04x}{note}")
+    return 0
+
+
+def cmd_diff(path: str) -> int:
+    before = read_region(path)
+    print(f"Mode before: {describe_mode(before[hw.EC_REG_MODE_READ])}")
+    print()
+    try:
+        input("Press the front-panel thermal-mode button, then press Enter... ")
+    except EOFError:
+        print("nothing to read from stdin", file=sys.stderr)
+        return 1
+    after = read_region(path)
+    print()
+    print(f"Mode after:  {describe_mode(after[hw.EC_REG_MODE_READ])}")
+    print()
+    print("Bytes that changed:")
+    return diff(before, after)
+
+
+def cmd_watch(path: str, seconds: float) -> int:
+    listener = hw.open_acpi_event_listener()
+    if listener is None:
+        print("could not subscribe to the ACPI netlink feed; the kernel may not "
+              "expose it here", file=sys.stderr)
+        print("falling back to polling the mode register", file=sys.stderr)
+
+    mode = hw.read_ec_byte(hw.EC_REG_MODE_READ, path)
+    print(f"Watching for {seconds:.0f}s. Current mode: {describe_mode(mode)}")
+    print("Press the front-panel button now.")
+    print()
+
+    deadline = time.monotonic() + seconds
+    seen_button = False
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+
+        if listener is not None:
+            try:
+                ready, _, _ = select.select([listener], [], [], min(1.0, remaining))
+            except InterruptedError:
+                continue
+            if ready:
+                for event in hw.read_acpi_events(listener):
+                    device_class, bus_id, etype, data = event
+                    stamp = time.strftime("%H:%M:%S")
+                    marker = ""
+                    if hw.is_button_event(event):
+                        seen_button = True
+                        marker = "   <-- thermal-mode button"
+                    print(f"  {stamp}  {device_class} {bus_id} "
+                          f"{etype:#010x} {data:#010x}{marker}")
+        else:
+            time.sleep(min(1.0, remaining))
+
+        try:
+            current = hw.read_ec_byte(hw.EC_REG_MODE_READ, path)
+        except hw.EcAccessError as exc:
+            print(f"  EC read failed: {exc}", file=sys.stderr)
+            break
+        if current != mode:
+            print(f"  mode changed: {describe_mode(mode)} -> "
+                  f"{describe_mode(current)}")
+            mode = current
+
+    print()
+    if listener is not None:
+        listener.close()
+
+    if seen_button:
+        print("Result: the button event was received over the ACPI netlink feed. "
+              "The daemon will react instantly.")
+        return 0
+
+    print("Result: no ACPI button event was seen in that window.")
+    print("If the mode did change above, the event path does not reach userspace "
+          "on this")
+    print("firmware and the daemon will fall back to polling "
+          "(poll_interval seconds).")
+    print("If the mode did NOT change either, the button was not pressed.")
+    return 1
+
+
+def cmd_capture(path: str, seconds: float,
+                interval: float = CAPTURE_INTERVAL) -> int:
+    print("Polling the whole 256-byte EC window.  Pressing a button will show "
+          "up here")
+    print("as the registers it touches change.")
+    print()
+    print("  Press the FAN-MODE button (the one above the power button) a few")
+    print("  times, pausing about two seconds between presses, then hold it for")
+    print("  two seconds to turn the light off, then press it once more to turn")
+    print("  the light back on.")
+    print()
+    for remaining in range(CAPTURE_COUNTDOWN, 0, -1):
+        print(f"  starting in {remaining}...", flush=True)
+        time.sleep(1.0)
+
+    try:
+        baseline = read_region(path)
+    except hw.EcAccessError as exc:
+        print(f"  could not read the EC window: {exc}", file=sys.stderr)
+        return 1
+
+    log = TransitionLog(baseline)
+    print()
+    print(f"  baseline: EC[{hw.EC_REG_MODE_READ:#04x}] = "
+          f"{baseline[hw.EC_REG_MODE_READ]} "
+          f"({describe_mode(baseline[hw.EC_REG_MODE_READ])})")
+    print()
+
+    polls = 0
+    start = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed >= seconds:
+            break
+        try:
+            sample = read_region(path)
+        except hw.EcAccessError as exc:
+            print(f"  EC read failed after {elapsed:.1f}s: {exc}", file=sys.stderr)
+            break
+        polls += 1
+        for offset, old, new in log.observe(sample, elapsed):
+            label = register_label(offset)
+            suffix = f"   <-- {label}" if label else ""
+            print(f"  +{elapsed:5.1f}s  EC[{offset:#04x}] {old:#04x} -> "
+                  f"{new:#04x}{suffix}", flush=True)
+        time.sleep(interval)
+
+    print()
+    print(f"{polls} polls over {time.monotonic() - start:.1f}s.")
+    print()
+    changed = log.changed_offsets()
+    if not changed:
+        print("Nothing in the window changed.  Either the button was not")
+        print("pressed, or its state is not held in these 256 bytes at all.")
+        return 1
+
+    print("Registers that changed:")
+    for offset in changed:
+        values = log.values_seen(offset)
+        distinct = sorted(set(values))
+        label = register_label(offset)
+        note = f"  ({label})" if label else ""
+        print(f"  EC[{offset:#04x}]  {len(log.transitions[offset])} change(s), "
+              f"{len(distinct)} distinct value(s): {distinct}{note}")
+
+    print()
+    print("A register that moved on every press and holds a small number of "
+          "values is")
+    print("the button's state; anything else that moved is a consequence of it "
+          "(a")
+    print("temperature, a fan duty, or the mode register).")
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Inspect the embedded controller and capture the "
+                    "thermal-mode button.",
+    )
+    parser.add_argument("--mode", action="store_true",
+                        help="print the thermal-mode registers and exit")
+    parser.add_argument("--dump", action="store_true",
+                        help="print the non-zero bytes of the 256-byte EC window")
+    parser.add_argument("--diff", action="store_true",
+                        help="snapshot, wait for a button press, and diff")
+    parser.add_argument("--capture", type=float, metavar="SECONDS",
+                        help="poll the whole EC window for SECONDS and report "
+                             "every register that changes")
+    parser.add_argument("--watch", type=float, metavar="SECONDS",
+                        help="report ACPI events for SECONDS and watch the mode")
+    parser.add_argument("--ec-path", default=hw.EC_DEBUGFS_PATH,
+                        help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+
+    path = args.ec_path
+    if not hw.ec_io_available(path):
+        print(f"{PROG}: {path} is not available. Load the module with: "
+              f"sudo modprobe ec_sys", file=sys.stderr)
+        return 1
+
+    try:
+        if args.dump:
+            return cmd_dump(path)
+        if args.diff:
+            return cmd_diff(path)
+        if args.capture:
+            return cmd_capture(path, args.capture)
+        if args.watch:
+            return cmd_watch(path, args.watch)
+        return cmd_mode(path)
+    except hw.EcAccessError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

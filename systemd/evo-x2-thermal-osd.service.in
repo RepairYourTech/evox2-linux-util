@@ -1,0 +1,54 @@
+[Unit]
+Description=Thermal-mode on-screen display for IP3-Tech Strix Halo mini-PCs (Linux replacement for ImagesShow)
+Documentation=file:@PREFIX@/README.md
+After=systemd-modules-load.service
+# ppd is pulled in, but deliberately NOT ordered against -- 'After=' here would
+# be an ordering cycle and systemd would delete this job at boot, leaving the
+# daemon dead (no OSD, no notifications, and nothing for the tray to read the
+# mode from).  power-profiles-daemon ships with 'After=multi-user.target' so
+# that it can order before graphical.target, while this service is wanted by
+# multi-user.target and is therefore implicitly ordered *before* it:
+#
+#     evo-x2-thermal-osd -> before -> multi-user.target -> before -> ppd
+#     ppd -> before -> evo-x2-thermal-osd            (this 'After=')
+#
+# ppd is unavoidably later than we are, so the OS power profile is mirrored by
+# the daemon retrying until ppd answers, rather than by ordering.
+Wants=power-profiles-daemon.service
+# Only run where the front-panel button's WMI interface actually exists.
+ConditionPathExists=/sys/bus/wmi/devices/8FAFC061-22DA-46E2-91DB-1FE3D7E5FF3C
+
+[Service]
+Type=simple
+# The installer drops a file into /etc/modules-load.d, but this makes the
+# unit self-sufficient if that has not happened yet.
+ExecStartPre=-/sbin/modprobe ec_sys
+ExecStart=@PYTHON@ @PREFIX@/daemon/evo-x2-thermal-osd --config @CONFIG@
+Restart=on-failure
+RestartSec=3
+
+# The daemon only ever *reads* the embedded controller.  Writing (the
+# evo-x2-power mode switcher) is always an explicit, separate action.
+RuntimeDirectory=evo-x2-linux-osd
+RuntimeDirectoryMode=0755
+
+# Hardening, but deliberately NOT ProtectSystem= / PrivateTmp= /
+# ProtectControlGroups=.  Those create a private mount namespace, and AppArmor's
+# path-based mediation of unix-socket connect() fails inside one:
+#
+#     apparmor="DENIED" operation="connect" class="file"
+#     info="Failed name lookup - disconnected path" error=-13
+#
+# notify-send is a common confinement target (Ubuntu derivatives ship
+# /etc/apparmor.d/notify-send), so sandboxing the daemon this way silently
+# breaks the notification the whole service exists to deliver.  The daemon also
+# falls back to calling org.freedesktop.Notifications over D-Bus with busctl,
+# which is not confined.
+NoNewPrivileges=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

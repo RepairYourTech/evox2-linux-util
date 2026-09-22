@@ -1,0 +1,14 @@
+<!--
+  Performance (mode 2): three bars, amber.
+
+  Note: no double hyphen may appear inside an XML comment, which is why the
+  family names are spelled out rather than abbreviated.
+
+  See evo-x2-quiet.svg for why the bars are counted, why there is no
+  `currentColor`, and how the colours were chosen.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <rect x="2" y="8" width="3" height="5" rx="1.5" fill="#c46a00"/>
+  <rect x="6.5" y="5" width="3" height="8" rx="1.5" fill="#c46a00"/>
+  <rect x="11" y="2" width="3" height="11" rx="1.5" fill="#c46a00"/>
+</svg>

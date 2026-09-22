@@ -1,0 +1,867 @@
+#!/usr/bin/env python3
+"""
+evo-x2-thermal-osd -- a Linux replacement for GMKtec's Windows-only
+"ImagesShow" on-screen display.
+
+The physical power-profile button on IP3-Tech Strix Halo mini-PCs (GMKtec
+EVO-X1/X2, Corsair AI Workstation 300, some Beelink GTR/SER AI, ...) fires an
+ACPI WMI event that no mainline driver subscribes to, and the toast that
+confirms the new mode is drawn by a Windows application that has no Linux
+build.  The mode itself is real, though: the embedded controller tracks it in
+EC[0x31].
+
+This daemon watches for the button (ACPI netlink event, with a slow poll as a
+safety net), reads the resulting mode out of the EC, shows a desktop
+notification, and optionally mirrors the choice into power-profiles-daemon so
+the OS-side profile follows the hardware.
+
+Run it as root (the EC debugfs node is root-only).  See README.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import logging
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                os.pardir, "lib"))
+
+import evo_x2_hw as hw  # noqa: E402
+import evo_x2_settings as settings  # noqa: E402
+
+PROG = "evo-x2-thermal-osd"
+DEFAULT_CONFIG = "/etc/evo-x2-linux-osd.conf"
+
+log = logging.getLogger(PROG)
+
+DEFAULTS = {
+    "user": "",
+    # On the EVO-X2 the poll is the only working trigger for a button press, so
+    # this is the OSD's real response time.  See docs/HOW-IT-WORKS.md section 7.
+    "poll_interval": "1.0",
+    "use_acpi_events": "yes",
+    "sync_power_profiles": "yes",
+    "sync_on_start": "no",
+    "show_notifications": "yes",
+    "notify_timeout_ms": "3000",
+    # Re-apply the last mode at startup.  Only firmware that forgets the
+    # selection across a cold boot needs this, and the switch that turns it on
+    # lives in the session user's settings, so it is read from there.
+    "restore_on_boot": "no",
+    "log_level": "info",
+}
+
+ICON_KEYS = {m.key: m.icon for m in hw.MODES}
+
+#: How long after a mode change further changes still count as the same event.
+FLAP_WINDOW = 6.0
+
+#: How long a reading must hold still before a burst of changes is considered
+#: over.
+SETTLE_SECONDS = 2.6
+
+#: How long a burst stays open regardless of how still the reading looks.
+#: Without it a flare whose individual steps are slower than SETTLE_SECONDS
+#: would be closed again between two of them.  This delays only the *decision*
+#: that a burst is finished, never the first report, so the panel button still
+#: feels immediate.
+MIN_BURST_SECONDS = 4.0
+
+#: The start-up power-profile sync is a retry, not a one-shot call, because
+#: power-profiles-daemon cannot be up yet when this daemon starts: ppd orders
+#: itself after multi-user.target (it has to, so that it can order before
+#: graphical.target) and this daemon is wanted by that same target.  Ordering
+#: after ppd from here is an ordering cycle systemd resolves by deleting the
+#: job, so the sync waits for ppd instead.  See the unit file for the detail.
+PPD_STARTUP_RETRIES = 30
+PPD_STARTUP_INTERVAL = 1.0
+
+
+class ModeTracker:
+    """Decides what a sequence of EC mode readings means.
+
+    The EC's mode register is not always stable.  On 2026-09-21 20:59 it was
+    observed to walk Quiet -> Balanced -> Performance over five seconds, with
+    each value holding for two to three seconds and no button anywhere near
+    it; the daemon turned that into three notifications, three power-profile
+    changes and, in between, a tray icon showing a mode the machine was not in.
+
+    No short confirmation timer can tell that apart from a real press, because
+    the flare's individual steps hold for longer than a notification may
+    reasonably be delayed.  What separates them is the ending: the walk came
+    back to where it started.  So a change is acted on at once -- a genuine
+    press has to feel immediate -- but it opens a *burst*, and further changes
+    inside FLAP_WINDOW belong to that same event and are not announced again.
+    When the burst stops moving the tracker reports where it landed, and the
+    caller can undo the whole thing if that is where it began.
+
+    Kept free of the EC and of the notifier so the behaviour can be tested
+    without hardware: `read` and the clock are both supplied by the caller.
+    """
+
+    def __init__(self, current, now=0.0, window=FLAP_WINDOW,
+                 settle=SETTLE_SECONDS, min_burst=MIN_BURST_SECONDS):
+        self.mode = current
+        self.origin = current
+        #: The last value the caller was told to announce.  The mode in effect
+        #: at startup is deliberately not announced, so it is the starting
+        #: point rather than something to be reported later.
+        self.announced = current
+        self.last_change = now
+        self.started = now
+        self.window = window
+        self.settle = settle
+        self.min_burst = min_burst
+        self.bursting = False
+
+    def adopt(self, value, now=0.0):
+        """Take `value` as the mode in effect, without announcing it.
+
+        The daemon moves the mode itself when it restores one at boot.  A pass
+        later the loop samples that new value, and to the tracker it is
+        indistinguishable from a button press -- so without this a restore
+        would surface as a notification about a mode the user picked yesterday.
+        """
+        self.mode = value
+        self.origin = value
+        self.announced = value
+        self.last_change = now
+        self.started = now
+        self.bursting = False
+
+    def update(self, value, now):
+        """-> list of events, in order.
+
+        ('changed', index)                    a new mode: report and apply it.
+        ('settled', index, origin, announce)  the burst stopped.  `origin` is
+            the mode in effect before it started, and `announce` says whether
+            `index` still needs reporting -- False when it is the value the
+            caller was already told about when the burst opened, which is the
+            ordinary case of one clean mode change.
+        """
+        events = []
+        if value is None:
+            return events
+
+        if value != self.mode:
+            if self.bursting and now - self.last_change <= self.window:
+                # More of the same event.  Follow it silently: whatever it
+                # settles on is reported when the burst closes, so the OSD is
+                # not spammed by the steps in between.
+                self.mode = value
+                self.last_change = now
+                return events
+            # A new event, whether or not the previous one ever settled.
+            self.origin = self.mode
+            self.mode = value
+            self.announced = value
+            self.last_change = now
+            self.started = now
+            self.bursting = True
+            events.append(("changed", value))
+            return events
+
+        if (self.bursting and now - self.last_change >= self.settle
+                and now - self.started >= self.min_burst):
+            self.bursting = False
+            announce = self.mode != self.announced
+            if announce:
+                self.announced = self.mode
+            events.append(("settled", self.mode, self.origin, announce))
+        return events
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+def _as_bool(value, default=False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "yes", "true", "on", "y")
+
+
+def load_config(path: str) -> dict:
+    cfg = dict(DEFAULTS)
+    parser = configparser.ConfigParser()
+    if path and os.path.exists(path):
+        try:
+            parser.read(path)
+        except (configparser.Error, OSError) as exc:
+            log.warning("ignoring unreadable config %s: %s", path, exc)
+            return cfg
+
+    if parser.has_section("osd"):
+        for key, value in parser.items("osd"):
+            cfg[key.replace("-", "_")] = value
+    if parser.has_section("icons"):
+        for key, value in parser.items("icons"):
+            if key in ICON_KEYS:
+                cfg["icon_" + key] = value
+    return cfg
+
+
+def icon_for(cfg: dict, mode) -> str:
+    return cfg.get("icon_" + mode.key) or mode.icon
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+def build_session_env(user) -> dict:
+    runtime = f"/run/user/{user.pw_uid}"
+    env = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": user.pw_dir,
+        "USER": user.pw_name,
+        "LOGNAME": user.pw_name,
+        "SHELL": user.pw_shell or "/bin/sh",
+        "XDG_RUNTIME_DIR": runtime,
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus",
+    }
+    for name in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"):
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    if "DISPLAY" not in env and "WAYLAND_DISPLAY" not in env:
+        env["DISPLAY"] = ":0"
+    return env
+
+
+def _child_kwargs(user) -> dict:
+    """Subprocess options that drop root before running a session command."""
+    kwargs = {}
+    if os.geteuid() == 0 and user.pw_uid != os.geteuid():
+        kwargs["user"] = user.pw_uid
+        kwargs["group"] = user.pw_gid
+        kwargs["extra_groups"] = []
+    return kwargs
+
+
+class Notifier:
+    """Delivers the OSD toast, over either of two independent transports.
+
+    notify-send (libnotify) is preferred, because it handles icons, hints and
+    desktop quirks for us.  It is also a popular confinement target: this
+    machine ships /etc/apparmor.d/notify-send, and AppArmor's socket-path
+    mediation is denied outright when the *caller* runs in a private mount
+    namespace --
+
+        apparmor="DENIED" operation="connect" class="file"
+        info="Failed name lookup - disconnected path" error=-13
+
+    -- which is what ProtectSystem=/PrivateTmp=/ProtectControlGroups= create
+    (see the unit file).  When notify-send is missing or refused we call
+    org.freedesktop.Notifications ourselves with busctl, which ships with
+    systemd and is not confined.
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.replaces_id = 0
+        self.transport = None
+        self._warned = set()
+
+    # -- plumbing ---------------------------------------------------------
+
+    def timeout_ms(self) -> int:
+        try:
+            return max(0, int(float(self.cfg.get("notify_timeout_ms") or 3000)))
+        except (TypeError, ValueError):
+            return 3000
+
+    def _warn_once(self, key: str, message: str, *args) -> None:
+        if key in self._warned:
+            log.debug(message, *args)
+        else:
+            self._warned.add(key)
+            log.warning(message, *args)
+
+    def _run(self, command, user):
+        """-> (returncode, stdout, stderr); returncode is None on spawn failure."""
+        try:
+            result = subprocess.run(
+                command, env=build_session_env(user),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=10, **_child_kwargs(user),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, "", str(exc)
+        return (result.returncode,
+                (result.stdout or b"").decode(errors="replace"),
+                (result.stderr or b"").decode(errors="replace").strip())
+
+    # -- transports -------------------------------------------------------
+
+    def libnotify_command(self, mode, binary: str = "notify-send") -> list:
+        return [
+            binary,
+            "--app-name=Thermal mode",
+            "--icon=" + icon_for(self.cfg, mode),
+            "--urgency=normal",
+            f"--expire-time={self.timeout_ms()}",
+            # Replaces the previous toast instead of stacking, so repeated
+            # button presses behave like a single OSD element.
+            "--hint=string:x-canonical-private-synchronous:evo-x2-thermal-mode",
+            "--category=device",
+            f"Thermal mode: {mode.name}",
+            mode.description,
+        ]
+
+    def dbus_command(self, mode, busctl: str = "busctl") -> list:
+        """The busctl invocation for org.freedesktop.Notifications.Notify.
+
+        Arguments follow the method's declared signature, in order:
+
+            Notify(s app_name, u replaces_id, s app_icon, s summary,
+                   s body, as actions, a{sv} hints, i expire_timeout) -> u
+
+        The empty array and dictionary are passed as a bare "0", which is
+        how busctl spells an empty container.
+        """
+        return [
+            busctl, "--user", "call",
+            "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+            "Notify",
+            "susssasa{sv}i",
+            "Thermal mode",                     # app_name
+            str(self.replaces_id),              # replaces_id
+            icon_for(self.cfg, mode),           # app_icon
+            f"Thermal mode: {mode.name}",       # summary
+            mode.description,                   # body
+            "0",                                # actions (empty)
+            "0",                                # hints (empty)
+            str(self.timeout_ms()),             # expire_timeout
+        ]
+
+    def _via_libnotify(self, user, mode) -> bool:
+        binary = shutil.which("notify-send")
+        if binary is None:
+            self._warn_once("no-notify-send",
+                            "notify-send not installed; falling back to a "
+                            "direct D-Bus call")
+            return False
+
+        code, _out, detail = self._run(self.libnotify_command(mode, binary), user)
+        if code == 0:
+            self.transport = "libnotify"
+            log.info("notified %s via notify-send: %s", user.pw_name, mode.name)
+            return True
+
+        self._warn_once("notify-send",
+                        "notify-send could not show the notification (%s); "
+                        "falling back to a direct D-Bus call", detail or f"exit {code}")
+        return False
+
+    def _via_dbus(self, user, mode) -> bool:
+        busctl = shutil.which("busctl")
+        if busctl is None:
+            self._warn_once("no-busctl",
+                            "busctl not found, so there is no fallback "
+                            "transport for notifications")
+            return False
+
+        code, out, detail = self._run(self.dbus_command(mode, busctl), user)
+        if code == 0:
+            # busctl prints the returned id as e.g. "u 21"; reuse it next time.
+            match = re.search(r"\bu\s+(\d+)", out)
+            if match:
+                self.replaces_id = int(match.group(1))
+            self.transport = "dbus"
+            log.info("notified %s via D-Bus: %s", user.pw_name, mode.name)
+            return True
+
+        self._warn_once("busctl", "direct D-Bus notification failed: %s",
+                        detail or f"exit {code}")
+        return False
+
+    def send(self, user, mode) -> bool:
+        """Show the OSD-style toast as the logged-in session user."""
+        if user is None:
+            log.debug("no session user found; skipping notification")
+            return False
+
+        order = [self._via_libnotify, self._via_dbus]
+        if self.transport == "dbus":
+            order.reverse()
+        for attempt in order:
+            if attempt(user, mode):
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# power-profiles-daemon sync
+# ---------------------------------------------------------------------------
+
+def sync_ppd(cfg: dict, mode, warn: bool = True) -> bool:
+    """Point the OS power profile at `mode`.
+
+    `warn` is False for the start-up retries, where a failure is expected
+    rather than noteworthy -- ppd has not started yet -- so that a boot does
+    not fill the journal with one complaint per second.  Giving up is still
+    reported by the caller.
+    """
+    report = log.warning if warn else log.debug
+
+    if not _as_bool(cfg.get("sync_power_profiles"), True):
+        return False
+
+    binary = shutil.which("powerprofilesctl")
+    if binary is None:
+        log.debug("powerprofilesctl not installed; not syncing OS profile")
+        return False
+
+    try:
+        result = subprocess.run(
+            [binary, "set", mode.ppd],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        report("powerprofilesctl set %s failed: %s", mode.ppd, exc)
+        return False
+
+    if result.returncode != 0:
+        detail = (result.stderr or b"").decode(errors="replace").strip()
+        report("powerprofilesctl set %s exited %d%s", mode.ppd,
+               result.returncode, f": {detail}" if detail else "")
+        return False
+    log.info("OS power profile -> %s", mode.ppd)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def describe(index) -> str:
+    if index is None:
+        return "unknown"
+    try:
+        mode = hw.mode_from_index(index)
+    except hw.ModeError:
+        return f"unknown ({index})"
+    return f"{mode.name} ({index})"
+
+
+def resolve_user(cfg: dict, state: dict):
+    """The session user, discovered lazily so a login after boot works."""
+    user = state.get("user")
+    if user is None:
+        user = hw.find_session_user(cfg.get("user", ""))
+        state["user"] = user
+    return user
+
+
+def handle_change(index: int, cfg: dict, state: dict) -> None:
+    try:
+        mode = hw.mode_from_index(index)
+    except hw.ModeError:
+        log.warning("EC reports unexpected mode %d; nothing to do", index)
+        return
+
+    log.info("thermal mode -> %s", mode.name)
+    hw.write_state_file(index)
+    remember_mode(state, index)
+
+    if state.get("dry_run"):
+        log.info("dry run: would notify '%s' and set OS profile '%s'",
+                 mode.name, mode.ppd)
+        return
+
+    sync_ppd(cfg, mode)
+    if not _as_bool(cfg.get("show_notifications"), True):
+        return
+
+    notifier = state["notifier"]
+    if notifier.send(resolve_user(cfg, state), mode):
+        return
+
+    # The session may have changed (login, logout, user switch): re-resolve.
+    state["user"] = hw.find_session_user(cfg.get("user", ""))
+    notifier.send(state["user"], mode)
+
+
+def settle(index: int, origin: int, announce: bool, cfg: dict,
+           state: dict) -> None:
+    """A burst of mode changes has stopped moving.
+
+    If it finished where it began it was the EC flapping rather than a press.
+    The mode was announced once when the burst started, so undo that by
+    putting the OS profile and the published state back and staying quiet.
+
+    Otherwise it is a real change.  `announce` is False for the ordinary case
+    of a single clean change, which was already reported when the burst
+    opened; it is only True when the burst wandered through other modes first
+    and landed on one the user has not been shown.
+    """
+    if index == origin:
+        pass                      # fall through to the undo below
+    elif announce:
+        handle_change(index, cfg, state)
+        return
+    else:
+        # Already reported.  Nothing to say and nothing to take back: the
+        # state file was written when the burst opened.
+        return
+
+    log.info("EC mode flapped to %s and back; undoing", describe(index))
+    hw.write_state_file(index)
+    if state.get("dry_run"):
+        return
+    try:
+        sync_ppd(cfg, hw.mode_from_index(index))
+    except hw.ModeError:
+        pass
+
+
+def startup_sync_retry(tries: int, now: float):
+    """When to try the start-up power-profile sync again, or None to stop.
+
+    Kept separate from the loop so the give-up point is testable without
+    waiting for a boot.
+    """
+    if tries >= PPD_STARTUP_RETRIES:
+        return None
+    return now + PPD_STARTUP_INTERVAL
+
+
+def poll_interval(cfg: dict) -> float:
+    try:
+        return max(0.25, float(cfg.get("poll_interval", 1.0)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def session_settings(state: dict):
+    """The session user's settings file, re-read when it changes on disk.
+
+    The daemon runs as root and so does not inherit the user's environment;
+    the file is found from their home directory.  Re-reading it rather than
+    capturing it once is what makes a switch in the window apply to the next
+    mode change instead of to the next restart.
+    """
+    user = state.get("user")
+    if user is None:
+        state["settings"] = None
+        return None
+    path = settings.settings_path(user.pw_dir)
+    prefs = state.get("settings")
+    if prefs is None or prefs.path != path:
+        prefs = settings.Settings(path=path)
+        state["settings"] = prefs
+    else:
+        prefs.reload_if_changed()
+    return prefs
+
+
+def effective(cfg: dict, state: dict) -> dict:
+    """The administrator's config with the session user's preferences on top.
+
+    Only the keys in evo_x2_settings.KEYS can be overridden, so a user cannot
+    reach the settings that are the administrator's business -- which user is
+    notified, which icons are used, whether the OS profile is mirrored.
+    Command line flags are applied last, from state['forced'].
+    """
+    result = dict(cfg)
+    prefs = session_settings(state)
+    if prefs is not None:
+        result.update(prefs.explicit())
+    result.update(state.get("forced") or {})
+    return result
+
+
+def remember_mode(state: dict, index: int) -> None:
+    """Record the mode so restore_on_boot can put it back.
+
+    Stored beside the switch that uses it, in the user's settings, and only
+    written when it actually changes, so it is a rare write.
+    """
+    prefs = session_settings(state)
+    if prefs is None:
+        return
+    try:
+        key = hw.mode_from_index(index).key
+    except hw.ModeError:
+        return
+    if prefs.get("restore_mode") == key:
+        return
+    prefs.set("restore_mode", key)
+    prefs.save()
+
+
+def restore_last_mode(cfg: dict, state: dict):
+    """Re-apply the mode that was in use before the last shutdown.
+
+    -> the index it restored, or None if it changed nothing.  The caller needs
+    that, because a change made here must not be mistaken for a button press a
+    second later.
+
+    Deferred until a session user is known, because both the switch and the
+    remembered mode live in that user's settings, and because a machine can
+    boot long before anyone logs in.  Firmware that keeps the selection in the
+    EC makes this a no-op: the mode already reads back as the saved one.
+    """
+    if state.get("user") is None:
+        return None
+    state["restore_pending"] = False
+
+    prefs = session_settings(state)
+    if prefs is None or not prefs.get_bool("restore_on_boot"):
+        return None
+
+    key = (prefs.get("restore_mode") or "").strip()
+    if not key:
+        return None
+    try:
+        wanted = hw.mode_from_key(key)
+    except hw.ModeError:
+        log.warning("ignoring unreadable saved mode %r", key)
+        return None
+
+    if state.get("dry_run"):
+        log.info("dry run: would restore thermal mode %s", wanted.name)
+        return None
+
+    try:
+        current = hw.read_mode()
+    except hw.EcAccessError as exc:
+        log.debug("cannot check the mode to restore: %s", exc)
+        return None
+    if current == wanted.index:
+        log.info("thermal mode is already %s; nothing to restore", wanted.name)
+        return None
+
+    try:
+        hw.write_mode(wanted)
+    except hw.EcAccessError as exc:
+        log.warning("could not restore thermal mode %s: %s", wanted.name, exc)
+        return None
+
+    log.info("restored thermal mode %s", wanted.name)
+    # Publish it, exactly as a button press does.  The tray cannot read the EC
+    # and goes by this file, so without it the icon would keep showing the mode
+    # we have just moved away from.
+    hw.write_state_file(wanted.index)
+    # Let the EC commit, so the value the loop reads next agrees with the
+    # baseline the caller adopts for it.
+    time.sleep(0.4)
+    return wanted.index
+
+
+def run(args) -> int:
+    cfg = load_config(args.config)
+    if args.verbose:
+        cfg["log_level"] = "debug"
+
+    level = getattr(logging, str(cfg.get("log_level", "info")).upper(), logging.INFO)
+    logging.basicConfig(level=level,
+                        format="%(levelname)s %(message)s",
+                        stream=sys.stderr)
+
+    poll = poll_interval(cfg)
+
+    # Command line flags outrank the user's own settings, so an administrator
+    # running --no-notify is not overruled by a switch in someone's window.
+    forced = {}
+    if args.no_ppd:
+        forced["sync_power_profiles"] = "no"
+    if args.no_notify:
+        forced["show_notifications"] = "no"
+    if args.read_only:
+        forced["sync_power_profiles"] = "no"
+        forced["sync_on_start"] = "no"
+    cfg.update(forced)
+
+    user = hw.find_session_user(cfg.get("user", ""))
+    if user is None:
+        log.warning("could not identify a graphical session user; "
+                    "set 'user = <name>' in %s to get notifications", args.config)
+
+    if args.once:
+        index = hw.read_mode()
+        if index is None:
+            print("unknown")
+            return 1
+        print(f"{index} {describe(index).split(' (')[0].lower()}")
+        return 0
+
+    if not hw.ec_io_available():
+        log.error("cannot see %s -- is the ec_sys module loaded? "
+                  "(modprobe ec_sys)", hw.EC_DEBUGFS_PATH)
+        return 1
+
+    state = {"user": user, "dry_run": args.dry_run, "notifier": Notifier(cfg),
+             "settings": None, "forced": forced, "restore_pending": True}
+    stopping = {"now": False}
+
+    def _stop(signum, _frame):
+        log.info("received %s, shutting down", signal.Signals(signum).name)
+        stopping["now"] = True
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    listener = None
+    if _as_bool(cfg.get("use_acpi_events"), True):
+        listener = hw.open_acpi_event_listener()
+        if listener is None:
+            log.warning("ACPI netlink events unavailable; polling every %.1fs", poll)
+        else:
+            log.info("watching ACPI WMI events (button notify id 0x%02X)",
+                     hw.WMI_BUTTON_NOTIFY_ID)
+    else:
+        listener = None
+
+    last = hw.read_mode()
+    if last is None:
+        log.error("could not read the current thermal mode from the EC")
+        return 1
+
+    log.info("current thermal mode: %s", describe(last))
+    hw.write_state_file(last)
+
+    if _as_bool(cfg.get("sync_on_start"), False) and not args.dry_run:
+        # Retried by the loop rather than attempted here: ppd cannot have
+        # started yet (see PPD_STARTUP_RETRIES).
+        startup_sync = {"tries": 0, "at": time.monotonic()}
+    else:
+        startup_sync = None
+
+    tracker = ModeTracker(last, time.monotonic())
+    read_failures = 0
+    while not stopping["now"]:
+        # Re-read the user's preferences every pass rather than once at
+        # startup, so a switch in the window applies to the next mode change
+        # instead of the next restart -- and so a changed poll interval is
+        # actually felt.
+        live = effective(cfg, state)
+        poll = poll_interval(live)
+
+        if startup_sync is not None and time.monotonic() >= startup_sync["at"]:
+            try:
+                wanted = hw.mode_from_index(last)
+            except hw.ModeError:
+                startup_sync = None
+            else:
+                if sync_ppd(live, wanted, warn=False):
+                    log.info("OS power profile at start-up -> %s", wanted.ppd)
+                    startup_sync = None
+                else:
+                    startup_sync["tries"] += 1
+                    again = startup_sync_retry(startup_sync["tries"],
+                                               time.monotonic())
+                    if again is None:
+                        log.warning("giving up on the start-up power-profile "
+                                    "sync after %d tries", startup_sync["tries"])
+                        startup_sync = None
+                    else:
+                        startup_sync["at"] = again
+
+        if listener is not None:
+            try:
+                ready, _, _ = select.select([listener], [], [], poll)
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                log.warning("ACPI event socket failed (%s); falling back to polling", exc)
+                listener.close()
+                listener = None
+                ready = []
+            if ready:
+                for event in hw.read_acpi_events(listener):
+                    log.debug("ACPI event: %s", event)
+                    if not hw.is_button_event(event):
+                        continue
+                    # Press confirmed; re-read below.  Give the EC a moment
+                    # to commit the mode before we sample it.
+                    time.sleep(0.15)
+                    break
+        else:
+            time.sleep(poll)
+
+        try:
+            current = hw.read_mode()
+        except hw.EcAccessError as exc:
+            read_failures += 1
+            if read_failures in (1, 10):
+                log.warning("EC read failed: %s", exc)
+            continue
+
+        if read_failures >= 10:
+            log.info("EC reads recovered")
+        read_failures = 0
+
+        if state.get("user") is None:
+            # Nobody was logged in when we started; keep looking so that the
+            # first notification after a login is delivered.
+            state["user"] = hw.find_session_user(live.get("user", ""))
+
+        if state.get("restore_pending"):
+            restored = restore_last_mode(live, state)
+            if restored is not None:
+                # Our own change, not the button's.  Mirror the profile for it
+                # here, since no 'changed' event will be raised for it, and
+                # adopt it so the next pass does not read it back as a press.
+                last = restored
+                sync_ppd(live, hw.mode_from_index(restored))
+                tracker.adopt(restored, time.monotonic())
+                # `current` was sampled before the restore, so it is a reading
+                # of the mode we just moved away from.  Handing it to the
+                # tracker now would open a burst on the old value.
+                current = restored
+
+        for event in tracker.update(current, time.monotonic()):
+            if event[0] == "settled":
+                settle(event[1], event[2], event[3], live, state)
+            else:
+                handle_change(event[1], live, state)
+
+    if listener is not None:
+        listener.close()
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="On-screen display for the IP3-Tech Strix Halo "
+                    "thermal-mode button (Linux replacement for ImagesShow).",
+    )
+    parser.add_argument("--config", default=DEFAULT_CONFIG,
+                        help=f"config file (default: {DEFAULT_CONFIG})")
+    parser.add_argument("--once", action="store_true",
+                        help="print '<index> <name>' for the current mode and exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="log what would happen without notifying or syncing")
+    parser.add_argument("--read-only", action="store_true",
+                        help="never touch the OS power profile")
+    parser.add_argument("--no-ppd", action="store_true",
+                        help="do not mirror the mode into power-profiles-daemon")
+    parser.add_argument("--no-notify", action="store_true",
+                        help="do not display desktop notifications")
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="verbose logging (repeat for more)")
+    args = parser.parse_args(argv)
+
+    try:
+        return run(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+
+# Installed to /etc/xdg/autostart/org.evox2.Control.desktop, so the tray icon
+# is present at login for every user -- the Windows utility this replaces
+# always had its icon in the notification area.
+Name=Thermal Mode Tray
+Comment=Show the EVO-X2 thermal mode in the system tray
+Exec=evo-x2-control --tray
+Icon=evo-x2-control
+
+Terminal=false
+StartupNotify=false
+# An autostart entry only: it must not also appear in the application menu.
+NoDisplay=true
+
+X-GNOME-Autostart-enabled=true
+# The tray host is usually not up yet when autostart entries run.  This key is
+# honoured by GNOME and ignored by KDE, so --tray also retries registration
+# itself rather than depending on it.
+X-GNOME-Autostart-Delay=5

@@ -1,0 +1,10 @@
+<!--
+  Balanced (mode 1): two bars, blue.
+
+  See evo-x2-quiet.svg for why the bars are counted, why there is no
+  `currentColor`, and how the colours were chosen.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <rect x="4.25" y="8" width="3" height="5" rx="1.5" fill="#2a7de1"/>
+  <rect x="8.75" y="5" width="3" height="8" rx="1.5" fill="#2a7de1"/>
+</svg>

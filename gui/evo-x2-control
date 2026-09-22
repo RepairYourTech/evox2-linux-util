@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+"""
+evo-x2-control -- the desktop front end for the thermal-mode daemon.
+
+Shows which thermal mode the machine is in, lets you change it, and displays the
+live readings that prove the mode is doing something (clock, temperature,
+package power).  It also puts an icon in the system tray with the same controls.
+
+It runs entirely as your user: reading the mode goes through the value the daemon
+publishes, and switching modes shells out to evo-x2-power through the
+passwordless sudo rule the installer adds (or pkexec if you declined that).
+
+    evo-x2-control            open the window (and the tray icon)
+    evo-x2-control --tray     tray icon only; used by the autostart entry
+"""
+
+from __future__ import annotations
+
+import configparser
+import os
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, os.pardir, "lib"))
+sys.path.insert(0, HERE)
+
+CONFIG_PATH = "/etc/evo-x2-linux-osd.conf"
+UNIT_NAME = "evo-x2-thermal-osd.service"
+POWER_TOOL = "evo-x2-power"
+
+#: Must match the .desktop file name, or the shell cannot find the window icon.
+APP_ID = "org.evox2.Control"
+APP_NAME = "Thermal Mode"
+APP_ICON = "evo-x2-control"
+
+#: Icons this package installs itself, instead of names borrowed from the icon
+#: theme.  Adwaita and Yaru ship power-profile-*-symbolic and Breeze does not
+#: (verified: no matches under breeze-dark, and none in hicolor either), so a
+#: themed name leaves the tray icon blank on a stock KDE/Fedora/Arch desktop.
+#:
+#: Plain names, not -symbolic ones: plasmashell renders tray icons with Qt's SVG
+#: parser, which does not implement `currentColor` (the string is absent from
+#: libqsvg.so) and so drew every bar opaque black -- an invisible icon in a dark
+#: panel.  The shipped icons carry explicit colours and a bar count per mode.
+MODE_ICONS = {
+    0: "evo-x2-quiet",
+    1: "evo-x2-balanced",
+    2: "evo-x2-performance",
+    3: "evo-x2-sustained",
+}
+ICON_UNKNOWN = "evo-x2-unknown"
+
+MENU_OPEN = 1
+MODE_ITEM_BASE = 10          # 10..13 are the four modes
+MENU_DIAGNOSTICS = 21
+MENU_REFRESH = 22
+MENU_QUIT = 24
+
+#: An autostart entry can run before the desktop's own tray host has registered,
+#: so registration is retried rather than abandoned on the first attempt.
+TRAY_RETRY_ATTEMPTS = 12
+TRAY_RETRY_SECONDS = 5
+
+#: How often the tray icon re-reads the mode.  The daemon already polls the EC
+#: once a second and publishes the result, so this only has to notice it.  Doing
+#: it here rather than in the window is what lets the icon follow the physical
+#: button while no window is open, which is the normal case for a tray app.
+MODE_POLL_SECONDS = 2
+
+
+def _missing_dependency(exc: Exception) -> None:
+    print(f"{APP_NAME}: the graphical interface needs GTK 4 and libadwaita "
+          f"({type(exc).__name__}: {exc}).\n\n"
+          f"  Debian/Ubuntu : sudo apt install python3-gi gir1.2-gtk-4.0 "
+          f"gir1.2-adw-1 python3-dbus\n"
+          f"  Fedora        : sudo dnf install python3-gobject gtk4 libadwaita "
+          f"python3-dbus\n"
+          f"  Arch          : sudo pacman -S python-gobject gtk4 libadwaita "
+          f"python-dbus\n\n"
+          f"The daemon and the evo-x2-power command line keep working without "
+          f"any of this.", file=sys.stderr)
+    raise SystemExit(1)
+
+
+try:
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gio, GLib, Gtk
+    import dbus
+    from dbus.mainloop.glib import DBusGMainLoop
+except (ImportError, ValueError) as exc:      # pragma: no cover - env dependent
+    _missing_dependency(exc)
+
+# Adw.SwitchRow is libadwaita 1.2 and Adw.SpinRow is 1.4.  Everything current
+# has both -- Ubuntu 24.04 ships 1.5, Fedora and Arch ship newer -- but on an
+# older libadwaita the preference rows would raise AttributeError while the
+# window was being built, which reads like a bug in this program rather than
+# a missing package, so say so plainly instead.
+if not (hasattr(Adw, "SwitchRow") and hasattr(Adw, "SpinRow")):
+    _missing_dependency(
+        AttributeError(f"libadwaita {Adw.MAJOR_VERSION}.{Adw.MINOR_VERSION} "
+                       f"is too old; 1.4 is needed for the preference rows"))
+
+import evo_x2_hw as hw                        # noqa: E402
+import evo_x2_settings as userprefs           # noqa: E402
+from evo_x2_metrics import Metrics            # noqa: E402
+from tray import Tray, MenuItem               # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Talking to the rest of the system
+# ---------------------------------------------------------------------------
+
+def find_tool(name: str):
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in (f"/usr/local/bin/{name}", f"/usr/bin/{name}"):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def privileged_commands(*arguments):
+    """Ways to run evo-x2-power with the privileges it needs, best first."""
+    tool = find_tool(POWER_TOOL)
+    if tool is None:
+        return []
+    if os.geteuid() == 0:
+        return [[tool, *arguments]]
+    commands = []
+    if shutil.which("sudo"):
+        commands.append(["sudo", "-n", tool, *arguments])
+    if shutil.which("pkexec"):
+        commands.append(["pkexec", tool, *arguments])
+    return commands
+
+
+def run_privileged(*arguments):
+    """-> (ok, output).  Never prompts: sudo is used non-interactively."""
+    commands = privileged_commands(*arguments)
+    if not commands:
+        return False, (f"{POWER_TOOL} was not found; is evo-x2-linux-osd installed?")
+
+    message = ""
+    for command in commands:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=90)
+        except (OSError, subprocess.SubprocessError) as exc:
+            message = str(exc)
+            continue
+        if result.returncode == 0:
+            return True, (result.stdout or "").strip()
+        message = (result.stderr or result.stdout or "").strip()
+    return False, message or "the command failed"
+
+
+def daemon_state():
+    """(active: bool, description: str)"""
+    if shutil.which("systemctl") is None:
+        return False, "systemctl not available"
+    try:
+        result = subprocess.run(["systemctl", "is-active", UNIT_NAME],
+                                capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    state = (result.stdout or "").strip()
+    return result.returncode == 0, state or "unknown"
+
+
+def read_settings() -> dict:
+    """The daemon's effective configuration, for display.
+
+    The user's preferences are overlaid on the administrator's, in the same
+    order the daemon applies them, so the window reports what will actually
+    happen rather than only what is in /etc.
+    """
+    values = {"notifications": "yes", "sync": "yes", "poll": "1.0"}
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(CONFIG_PATH)
+    except (configparser.Error, OSError):
+        parser = None
+    if parser is not None and parser.has_section("osd"):
+        values["notifications"] = parser.get("osd", "show_notifications",
+                                             fallback="yes")
+        values["sync"] = parser.get("osd", "sync_power_profiles",
+                                    fallback="yes")
+        values["poll"] = parser.get("osd", "poll_interval", fallback="1.0")
+
+    override = userprefs.Settings().explicit()
+    if "show_notifications" in override:
+        values["notifications"] = override["show_notifications"]
+    if "poll_interval" in override:
+        values["poll"] = override["poll_interval"]
+    return values
+
+
+def yes_no(value: str) -> str:
+    return "on" if str(value).strip().lower() in ("yes", "true", "1", "on", "y") else "off"
+
+
+def tray_might_appear_later(reason: str) -> bool:
+    """True when the tray host may simply not have started yet.
+
+    A missing watcher or host is a startup race, worth waiting out.  A missing
+    session bus is not -- that will not fix itself, so retrying is pointless.
+    """
+    return ("StatusNotifierWatcher" in reason
+            or "tray host" in reason
+            or "could not register" in reason)
+
+
+# ---------------------------------------------------------------------------
+# The window
+# ---------------------------------------------------------------------------
+
+class ControlWindow(Adw.ApplicationWindow):
+    def __init__(self, application):
+        super().__init__(application=application, title=APP_NAME)
+        self.set_default_size(560, 720)
+        # On X11 the task manager reads the icon from here.  On Wayland it uses
+        # the window's app_id instead, which is why the .desktop file is named
+        # after APP_ID -- that is the link that puts the icon in the task bar.
+        self.set_icon_name(APP_ICON)
+
+        self.metrics = Metrics()
+        self.settings = None       # this user's preferences, loaded lazily
+        self._checks = {}
+        self._updating = False
+        self._ticks = 0
+
+        header = Adw.HeaderBar()
+        menu = Gio.Menu()
+        menu.append("Run diagnostics", "win.diagnostics")
+        menu.append("Quit", "win.quit")
+        button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
+        button.set_tooltip_text("Main menu")
+        header.pack_end(button)
+
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(header)
+        toolbar.set_content(self._build_content())
+        self.set_content(toolbar)
+
+        self._install_actions()
+        self.refresh_all()
+        GLib.timeout_add_seconds(1, self._tick)
+
+    # -- construction ------------------------------------------------------
+
+    def _build_content(self):
+        page = Adw.PreferencesPage()
+
+        # --- thermal mode ------------------------------------------------
+        self.mode_group = Adw.PreferencesGroup(
+            title="Thermal mode",
+            description="What the front-panel button cycles, and what the "
+                        "embedded controller has selected.")
+        page.add(self.mode_group)
+
+        previous = None
+        for mode in hw.MODES:
+            row = Adw.ActionRow(title=mode.name, subtitle=mode.description)
+            check = Gtk.CheckButton()
+            if previous is not None:
+                check.set_group(previous)
+            previous = check
+            check.connect("toggled", self._on_mode_toggled, mode)
+            row.add_prefix(check)
+            row.set_activatable_widget(check)
+            if not mode.documented:
+                badge = Gtk.Label(label="undocumented")
+                badge.add_css_class("dim-label")
+                badge.add_css_class("caption")
+                row.add_suffix(badge)
+            self.mode_group.add(row)
+            self._checks[mode.index] = check
+
+        # --- live readings ------------------------------------------------
+        status = Adw.PreferencesGroup(
+            title="What the mode is doing",
+            description="Only the first two rows come from the mode itself; the "
+                        "rest is the platform reacting to it.")
+        page.add(status)
+        self.rows = {}
+        for key, label in (("mode", "Hardware mode"),
+                           ("ppd", "OS power profile"),
+                           ("governor", "CPU governor"),
+                           ("epp", "Energy preference"),
+                           ("clock", "Mean clock"),
+                           ("temperature", "CPU temperature"),
+                           ("power", "Package power")):
+            row = Adw.ActionRow(title=label)
+            self.rows[key] = row
+            status.add(row)
+
+        # --- on-screen display -------------------------------------------
+        self.osd_group = Adw.PreferencesGroup(
+            title="On-screen display",
+            description=f"Effective values: your preferences below override "
+                        f"{CONFIG_PATH}.")
+        page.add(self.osd_group)
+        self.rows["daemon"] = Adw.ActionRow(title="Daemon")
+        self.rows["notifications"] = Adw.ActionRow(title="Notifications")
+        self.rows["sync"] = Adw.ActionRow(title="Mirror into power-profiles-daemon")
+        for key in ("daemon", "notifications", "sync"):
+            self.osd_group.add(self.rows[key])
+
+        # --- preferences --------------------------------------------------
+        self._build_preferences(page)
+
+        # --- actions ------------------------------------------------------
+        actions = Adw.PreferencesGroup()
+        page.add(actions)
+        diagnostics = Adw.ActionRow(
+            title="Diagnostics",
+            subtitle="Check every link from the driver to the notification.")
+        run = Gtk.Button(label="Run")
+        run.set_valign(Gtk.Align.CENTER)
+        run.connect("clicked", lambda *_: self._show_diagnostics())
+        diagnostics.add_suffix(run)
+        diagnostics.set_activatable_widget(run)
+        actions.add(diagnostics)
+
+        quit_row = Adw.ActionRow(
+            title="Quit",
+            subtitle="Closing the window keeps the tray icon running.")
+        quit_button = Gtk.Button(label="Quit")
+        quit_button.set_valign(Gtk.Align.CENTER)
+        quit_button.connect("clicked", lambda *_: self.get_application().quit())
+        quit_row.add_suffix(quit_button)
+        quit_row.set_activatable_widget(quit_button)
+        actions.add(quit_row)
+
+        return page
+
+    def _install_actions(self):
+        for name, handler in (("diagnostics", self._show_diagnostics),
+                              ("quit", lambda *_: self.get_application().quit())):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_: handler())
+            self.add_action(action)
+
+    # -- state ------------------------------------------------------------
+
+    def _on_mode_toggled(self, check, mode):
+        if self._updating or not check.get_active():
+            return
+        self.switch_mode(mode)
+
+    def switch_mode(self, mode) -> bool:
+        if not mode.documented:
+            dialog = Adw.AlertDialog(
+                heading=f"Use {mode.name} mode?",
+                body="This is an undocumented mode the front-panel button cannot "
+                     "reach. It holds the CPU near its boost frequency with a "
+                     "lower package-power cap: lower latency, lower throughput, "
+                     "and higher idle power and temperature.")
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("use", "Use it")
+            dialog.set_response_appearance("use", Adw.ResponseAppearance.SUGGESTED)
+            dialog.connect("response", lambda _d, response: (
+                self._do_switch(mode) if response == "use" else self.refresh_all()))
+            dialog.present(self)
+            return False
+        return self._do_switch(mode)
+
+    def _do_switch(self, mode) -> bool:
+        ok, output = run_privileged(mode.key)
+        if not ok:
+            self._error(f"Could not switch to {mode.name}", output)
+            self.refresh_all()
+            return False
+        # The EC commits asynchronously and the daemon needs a moment to notice.
+        GLib.timeout_add(600, self.refresh_all)
+        return True
+
+    # -- refresh -----------------------------------------------------------
+
+    def _tick(self):
+        self._ticks += 1
+        self.refresh_live()
+        if self._ticks % 5 == 0:
+            self.refresh_slow()
+        return True
+
+    def refresh_all(self):
+        self.refresh_live()
+        self.refresh_slow()
+
+    def refresh_live(self):
+        sample = self.metrics
+        temperature = sample.temperature()
+        self.rows["temperature"].set_subtitle(
+            f"{temperature:.1f} °C" if temperature is not None
+            else "not exposed by this platform")
+        power = sample.power()
+        source = f" ({sample.power_source})" if sample.power_source else ""
+        self.rows["power"].set_subtitle(
+            f"{power:.1f} W{source}" if power is not None
+            else "not exposed by this platform")
+        clock = sample.clock_mhz()
+        self.rows["clock"].set_subtitle(f"{clock:.0f} MHz" if clock is not None
+                                        else "unavailable")
+
+    def refresh_slow(self):
+        snapshot = self.metrics.snapshot()
+        index = snapshot["mode"]
+
+        self._updating = True
+        try:
+            for mode_index, check in self._checks.items():
+                check.set_active(mode_index == index)
+        finally:
+            self._updating = False
+
+        if index is None:
+            self.rows["mode"].set_subtitle("unknown -- is the daemon running?")
+        else:
+            detail = f"EC[{hw.EC_REG_MODE_READ:#04x}] = {index}"
+            if snapshot.get("mode_source") == "daemon":
+                detail += " (published by the daemon)"
+            self.rows["mode"].set_subtitle(detail)
+
+        profile = snapshot["ppd_profile"]
+        mode = snapshot["mode"]
+        expected = hw.MODES_BY_INDEX[mode].ppd if mode in hw.MODES_BY_INDEX else None
+        self.rows["ppd"].set_subtitle(profile or "power-profiles-daemon not present")
+        if profile and expected and profile != expected:
+            self.rows["ppd"].set_subtitle(f"{profile} (expected {expected})")
+
+        self.rows["governor"].set_subtitle(snapshot["governor"] or "unavailable")
+        self.rows["epp"].set_subtitle(snapshot["epp"] or "unavailable")
+
+        active, state = daemon_state()
+        if active:
+            self.rows["daemon"].set_subtitle(f"{UNIT_NAME}: {state}")
+        else:
+            self.rows["daemon"].set_subtitle(
+                f"{UNIT_NAME}: {state} (start it with: sudo systemctl start "
+                f"{UNIT_NAME})")
+
+        settings = read_settings()
+        self.rows["notifications"].set_subtitle(yes_no(settings["notifications"]))
+        self.rows["sync"].set_subtitle(yes_no(settings["sync"]))
+        self.refresh_preferences()
+
+        application = self.get_application()
+        if application is not None:
+            application.on_mode_changed(index)
+
+    # -- preferences -------------------------------------------------------
+
+    def _prefs(self):
+        """This user's preferences, re-read when the file changes on disk.
+
+        The daemon writes restore_mode into the same file, so a cached copy
+        goes stale; re-reading before a save is also what stops that from
+        being thrown away.
+        """
+        if self.settings is None:
+            self.settings = userprefs.Settings()
+        else:
+            self.settings.reload_if_changed()
+        return self.settings
+
+    def _build_preferences(self, page):
+        group = Adw.PreferencesGroup(
+            title="Preferences",
+            description=f"Yours alone, in {userprefs.settings_path()}. They "
+                        f"override {CONFIG_PATH} and apply immediately, with "
+                        f"no restart and no password.")
+        page.add(group)
+
+        self.autostart_row = Adw.SwitchRow(
+            title="Start the tray icon at login",
+            subtitle="An autostart entry for this user, not a system service.")
+        self.autostart_row.connect("notify::active", self._on_autostart_toggled)
+        group.add(self.autostart_row)
+
+        self.notify_row = Adw.SwitchRow(
+            title="Show a notification when the mode changes",
+            subtitle="The on-screen display the Windows utility drew.")
+        self.notify_row.connect("notify::active", self._on_notify_toggled)
+        group.add(self.notify_row)
+
+        self.restore_row = Adw.SwitchRow(
+            title="Restore the last mode at boot",
+            subtitle="Only needed if this firmware forgets the mode across a "
+                     "power cycle; harmless otherwise.")
+        self.restore_row.connect("notify::active", self._on_restore_toggled)
+        group.add(self.restore_row)
+
+        self.poll_row = Adw.SpinRow.new_with_range(0.25, 10.0, 0.25)
+        self.poll_row.set_title("Read the embedded controller every")
+        self.poll_row.set_subtitle(
+            "Seconds. This is the panel button's response time: lower is "
+            "snappier and costs a little more power.")
+        self.poll_row.set_digits(2)
+        self.poll_row.connect("notify::value", self._on_poll_changed)
+        group.add(self.poll_row)
+
+    def refresh_preferences(self):
+        prefs = self._prefs()
+        self._updating = True
+        try:
+            self.autostart_row.set_active(userprefs.autostart_enabled())
+            self.notify_row.set_active(
+                userprefs.as_bool(prefs.get("show_notifications"), True))
+            self.restore_row.set_active(
+                userprefs.as_bool(prefs.get("restore_on_boot"), False))
+            self.poll_row.set_value(prefs.get_float("poll_interval", 1.0))
+        finally:
+            self._updating = False
+
+    def _save_preference(self, key, value):
+        prefs = self._prefs()          # reloads first; see _prefs
+        prefs.set(key, value)
+        if not prefs.save():
+            self._error("Could not save preferences",
+                        f"Writing {prefs.path} failed.")
+        self.refresh_preferences()
+
+    def _on_autostart_toggled(self, row, _param):
+        if self._updating:
+            return
+        if not userprefs.set_autostart(row.get_active()):
+            self._error("Could not change the login setting",
+                        f"Writing under "
+                        f"{os.path.dirname(userprefs.autostart_path())} failed.")
+        self.refresh_preferences()
+
+    def _on_notify_toggled(self, row, _param):
+        if self._updating:
+            return
+        self._save_preference("show_notifications", row.get_active())
+
+    def _on_restore_toggled(self, row, _param):
+        if self._updating:
+            return
+        self._save_preference("restore_on_boot", row.get_active())
+
+    def _on_poll_changed(self, row, _param):
+        if self._updating:
+            return
+        self._save_preference("poll_interval", f"{row.get_value():g}")
+
+    # -- dialogs -----------------------------------------------------------
+
+    def _error(self, heading, body):
+        dialog = Adw.AlertDialog(heading=heading, body=body or "No further detail.")
+        dialog.add_response("close", "Close")
+        dialog.present(self)
+
+    def _show_diagnostics(self):
+        if find_tool(POWER_TOOL) is None:
+            self._error("Diagnostics unavailable",
+                        f"{POWER_TOOL} was not found in PATH.")
+            return
+        ok, output = run_privileged("--check")
+        if not ok and not output:
+            output = "no output"
+
+        view = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.NONE)
+        view.get_buffer().set_text(output)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_child(view)
+        scrolled.set_size_request(640, 420)
+
+        dialog = Adw.AlertDialog(
+            heading="Diagnostics",
+            body="Everything the daemon depends on, from the ACPI tables to the "
+                 "notification path.")
+        dialog.set_extra_child(scrolled)
+        dialog.add_response("close", "Close")
+        dialog.present(self)
+
+    # -- window behaviour --------------------------------------------------
+
+    def do_close_request(self):
+        """Hide instead of quitting while the tray icon is up."""
+        application = self.get_application()
+        if application is not None and application.tray_available():
+            self.set_visible(False)
+            return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# The application
+# ---------------------------------------------------------------------------
+
+class ControlApplication(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.window = None
+        self.tray = None
+        self.tray_only = False
+        self._current_mode = None
+        self._tray_started = False
+        self._tray_icon = None      # a real sentinel: None matches no icon name
+        self._metrics = Metrics()
+        self.add_main_option(
+            "tray", 0, GLib.OptionFlags.NONE, GLib.OptionArg.NONE,
+            "Start in the system tray without opening a window", None)
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        try:
+            DBusGMainLoop(set_as_default=True)
+        except Exception:      # noqa: BLE001 - only needed for the tray
+            pass
+        # The tray is not started here: --tray is not parsed yet at this point,
+        # and whether a tray-less run should exit depends on it.
+
+    def do_command_line(self, command_line):
+        options = command_line.get_options_dict()
+        self.tray_only = bool(options.contains("tray"))
+        self._ensure_tray()
+        if not self.tray_only:
+            self.present_window()
+        return 0
+
+    def do_activate(self):
+        # Reached on a genuine activation, not on our own command line (which we
+        # handle above), so this is always a real request for the window.
+        self.present_window()
+
+    # -- window ------------------------------------------------------------
+
+    def present_window(self):
+        if self.window is None:
+            self.window = ControlWindow(application=self)
+        self.window.set_visible(True)
+        self.window.present()
+        self.window.refresh_all()
+
+    # -- tray --------------------------------------------------------------
+
+    def _ensure_tray(self):
+        """Start the tray icon, once, however many times we are invoked."""
+        if self._tray_started:
+            return
+        self._tray_started = True
+        # A tray icon alone does not keep a GApplication alive.  With no window
+        # open the use count is zero, so without this hold `--tray` exits the
+        # instant it starts -- before the retry loop below could ever run.
+        self.hold()
+        self._start_tray()
+
+    def _start_tray(self, attempt=0):
+        tray = Tray(
+            title=f"{APP_NAME}: starting",
+            icon_name=ICON_UNKNOWN,
+            on_activate=self.present_window,
+            get_items=self._menu_items,
+            on_event=self._menu_event,
+        )
+        if tray.start():
+            self.tray = tray
+            self.on_mode_changed(self._read_mode())
+            GLib.timeout_add_seconds(MODE_POLL_SECONDS, self._poll_mode)
+            return
+
+        if attempt < TRAY_RETRY_ATTEMPTS and tray_might_appear_later(tray.reason):
+            # The hold above is what keeps the process alive across these.
+            GLib.timeout_add_seconds(TRAY_RETRY_SECONDS, self._start_tray,
+                                     attempt + 1)
+            return
+
+        # Hand the reference back.  A window, if one is open, holds the
+        # application by itself; a tray-only run now has nothing left to do and
+        # would otherwise linger forever with no icon.
+        self.release()
+        print(f"{APP_NAME}: no system-tray icon: {tray.reason}", file=sys.stderr)
+        if self.tray_only:
+            print(f"{APP_NAME}: nothing to show, exiting.", file=sys.stderr)
+            self.quit()
+
+    def _read_mode(self):
+        """Just the mode.  Avoids Metrics.snapshot(), which shells out."""
+        index = self._metrics.mode_index()
+        if index is None:
+            index = self._metrics.published_mode_index()
+        return index
+
+    def _poll_mode(self):
+        self.on_mode_changed(self._read_mode())
+        return True
+
+    def tray_available(self) -> bool:
+        return bool(self.tray and self.tray.available)
+
+    def _menu_items(self):
+        index = self._current_mode
+        items = [MenuItem(MENU_OPEN, label="Open Thermal Mode")]
+        items.append(MenuItem(2, kind="separator"))
+        for mode in hw.MODES:
+            if not mode.documented:
+                continue
+            items.append(MenuItem(MODE_ITEM_BASE + mode.index,
+                                  label=mode.name,
+                                  toggle_type="radio",
+                                  toggle_state=1 if index == mode.index else 0))
+        items.append(MenuItem(3, kind="separator"))
+        items.append(MenuItem(MENU_DIAGNOSTICS, label="Run diagnostics…"))
+        items.append(MenuItem(MENU_REFRESH, label="Refresh"))
+        items.append(MenuItem(4, kind="separator"))
+        items.append(MenuItem(MENU_QUIT, label="Quit"))
+        return items
+
+    def _menu_event(self, item_id):
+        if item_id == MENU_OPEN:
+            self.present_window()
+        elif item_id == MENU_QUIT:
+            self.quit()
+        elif item_id == MENU_REFRESH:
+            self._refresh_everything()
+        elif item_id == MENU_DIAGNOSTICS:
+            self.present_window()
+            if self.window is not None:
+                self.window._show_diagnostics()
+        elif MODE_ITEM_BASE <= item_id < MODE_ITEM_BASE + len(hw.MODES):
+            mode = hw.mode_from_index(item_id - MODE_ITEM_BASE)
+            ok, output = run_privileged(mode.key)
+            if not ok:
+                print(f"{APP_NAME}: could not switch to {mode.name}: {output}",
+                      file=sys.stderr)
+                return
+            if self.window is not None:
+                GLib.timeout_add(600, self._refresh_everything)
+
+    def _refresh_everything(self):
+        if self.window is not None:
+            self.window.refresh_all()
+        else:
+            self.on_mode_changed(Metrics().snapshot()["mode"])
+        return False
+
+    def on_mode_changed(self, index):
+        """Keep the tray icon and tooltip in step with the hardware."""
+        self._current_mode = index
+        if not self.tray_available():
+            return
+        # Keyed on the icon rather than on the previous index: each mode has a
+        # distinct icon, and an unknown mode maps to ICON_UNKNOWN, so comparing
+        # icons cannot miss an update when the mode is unreadable.
+        icon = MODE_ICONS.get(index, ICON_UNKNOWN)
+        if icon == self._tray_icon:
+            return
+        self._tray_icon = icon
+        self.tray.set_icon(icon)
+        try:
+            name = hw.mode_from_index(index).name
+        except (hw.ModeError, TypeError):
+            name = "unknown"
+        self.tray.set_title(f"{APP_NAME}: {name}")
+        self.tray.refresh()
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv if argv is None else argv)
+    application = ControlApplication()
+    return application.run(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

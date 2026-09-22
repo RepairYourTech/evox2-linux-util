@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""
+evo-x2-power -- read and change the thermal mode of IP3-Tech Strix Halo
+mini-PCs from Linux.
+
+    evo-x2-power                 show the current mode
+    evo-x2-power quiet           switch to Quiet
+    evo-x2-power balanced        switch to Balanced
+    evo-x2-power performance     switch to Performance
+    evo-x2-power sustained       switch to the undocumented 4th mode
+    evo-x2-power --list          list the modes
+    evo-x2-power --check         hardware/driver diagnostics
+
+Reading the current mode from a running daemon is unprivileged; switching
+modes (and reading straight from hardware) needs root.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                os.pardir, "lib"))
+
+import evo_x2_hw as hw  # noqa: E402
+
+PROG = "evo-x2-power"
+
+ALIASES = {
+    "eco": "quiet",
+    "silent": "quiet",
+    "low": "quiet",
+    "auto": "balanced",
+    "normal": "balanced",
+    "default": "balanced",
+    "medium": "balanced",
+    "perf": "performance",
+    "boost": "performance",
+    "high": "performance",
+    "turbo": "performance",
+    "sustain": "sustained",
+    "latency": "sustained",
+}
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+
+
+def _colour_enabled() -> bool:
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def paint(text: str, code: str) -> str:
+    return f"{code}{text}{RESET}" if _colour_enabled() else text
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def resolve_mode(text: str) -> hw.Mode:
+    key = str(text).strip().lower()
+    key = ALIASES.get(key, key)
+    return hw.mode_from_key(key)
+
+
+def can_read_hardware() -> bool:
+    return os.geteuid() == 0 and hw.ec_io_available()
+
+
+def current_mode_index(allow_state: bool = True):
+    """Best available view of the current mode.
+
+    Root reads the EC directly; everyone else falls back to the value the
+    daemon publishes in /run.
+    """
+    if can_read_hardware():
+        try:
+            return hw.read_mode(), "hardware"
+        except hw.EcAccessError:
+            pass
+    if allow_state:
+        published = hw.read_state_file()
+        if published is not None:
+            return published, "daemon"
+    return None, "unavailable"
+
+
+def ensure_module() -> None:
+    """Load ec_sys if we are root and it is missing."""
+    if hw.ec_io_available() or os.geteuid() != 0:
+        return
+    if shutil.which("modprobe") is None:
+        return
+    subprocess.run(["modprobe", "ec_sys"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(20):
+        if hw.ec_io_available():
+            return
+        time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_list() -> int:
+    index, _source = current_mode_index()
+    print("Available thermal modes:\n")
+    for mode in hw.MODES:
+        marker = "*" if index == mode.index else " "
+        note = "" if mode.documented else paint("  (undocumented, not on the button)", DIM)
+        print(f" {marker} {mode.index}  {mode.name:<12}{note}")
+        print(f"      {mode.description}")
+        print(paint(f"      OS profile: {mode.ppd}", DIM))
+        print()
+    print(paint("Switch with: sudo evo-x2-power <name>", DIM))
+    return 0
+
+
+def cmd_status(as_json: bool = False, short: bool = False) -> int:
+    index, source = current_mode_index()
+
+    if short:
+        if index is None:
+            # Say why on stderr rather than exiting silently, so a status bar
+            # or script can tell "no data" from "the value is empty".
+            print(f"{PROG}: cannot determine the current mode; is the daemon "
+                  f"running? (systemctl status evo-x2-thermal-osd)",
+                  file=sys.stderr)
+            return 1
+        print(index)
+        return 0
+
+    if as_json:
+        import json
+        mode = None
+        try:
+            mode = hw.mode_from_index(index) if index is not None else None
+        except hw.ModeError:
+            pass
+        print(json.dumps({
+            "mode": index,
+            "name": mode.name if mode else None,
+            "key": mode.key if mode else None,
+            "ppd_profile": mode.ppd if mode else None,
+            "source": source,
+        }))
+        return 0 if index is not None else 1
+
+    if index is None:
+        print("Thermal mode: unknown")
+        if not hw.ec_io_available():
+            print(paint("  ec_sys is not loaded, so the hardware cannot be "
+                        "read. Try: sudo modprobe ec_sys", DIM))
+        else:
+            print(paint("  Is the daemon running? "
+                        "systemctl status evo-x2-thermal-osd", DIM))
+        return 1
+
+    try:
+        mode = hw.mode_from_index(index)
+    except hw.ModeError:
+        print(f"Thermal mode: unknown ({index})")
+        return 1
+
+    print(f"{paint('Thermal mode:', BOLD)} {mode.name} ({index})")
+    print(f"  {mode.description}")
+    print(paint(f"  OS power profile: {mode.ppd}", DIM))
+    if source == "daemon":
+        print(paint("  (read from the daemon's published state; "
+                    "use sudo for a direct hardware read)", DIM))
+    return 0
+
+
+def cmd_set(text: str, yes: bool = False) -> int:
+    try:
+        mode = resolve_mode(text)
+    except hw.ModeError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+
+    if os.geteuid() != 0:
+        print(f"{PROG}: switching modes writes to the embedded controller and "
+              f"needs root.\n  Try: sudo {PROG} {mode.key}", file=sys.stderr)
+        return 1
+
+    ensure_module()
+    if not hw.ec_io_available():
+        print(f"{PROG}: {hw.EC_DEBUGFS_PATH} is unavailable. Load the module "
+              f"with: sudo modprobe ec_sys", file=sys.stderr)
+        return 1
+
+    before, _ = current_mode_index()
+    if before == mode.index:
+        print(f"Already in {mode.name} mode.")
+        return 0
+
+    if not mode.documented and not yes:
+        print(paint(
+            f"'{mode.name}' is an undocumented mode the front-panel button "
+            f"cannot reach.\nIt holds the CPU near boost frequency with a "
+            f"lower package power cap: lower latency,\nlower throughput, "
+            f"higher idle power and temperature. Re-run with --yes to confirm.",
+            DIM), file=sys.stderr)
+        return 3
+
+    try:
+        hw.write_mode(mode)
+    except hw.EcAccessError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 1
+
+    # The EC picks up FCMI asynchronously; give it a moment to commit.
+    for _ in range(30):
+        time.sleep(0.05)
+        try:
+            if hw.read_mode() == mode.index:
+                print(f"Thermal mode set to {paint(mode.name, BOLD)}.")
+                print(paint("The daemon will show the on-screen display and "
+                            "mirror it to your OS power profile.", DIM))
+                return 0
+        except hw.EcAccessError:
+            break
+
+    print(f"{PROG}: wrote EC[0x{hw.EC_REG_MODE_WRITE:02x}] but the EC still "
+          f"reports mode {before!r}. The write was rejected -- most likely "
+          f"ec_sys was loaded without write_support=1 (see the README).",
+          file=sys.stderr)
+    return 1
+
+
+def cmd_check() -> int:
+    problems = []
+    lines = []
+
+    def add(label: str, value: str, ok=None):
+        flag = " " if ok is None else ("ok " if ok else "FAIL")
+        lines.append(f"  [{flag}] {label}: {value}")
+
+    lines.append(f"{PROG} {_version()} -- diagnostics")
+    lines.append("")
+    lines.append("Hardware / firmware")
+    add("processor", _cmdline_value("sys_vendor", "/sys/class/dmi/id/sys_vendor")
+        + " " + _cmdline_value("product_name", "/sys/class/dmi/id/product_name"),
+        None)
+    add("kernel", os.uname().release, None)
+
+    event_ok = hw.wmi_device_present(hw.WMI_EVENT_GUID)
+    add("WMI event device", hw.WMI_EVENT_GUID,
+        event_ok)
+    if not event_ok:
+        problems.append("the WMI event GUID is missing: this machine is not "
+                        "the IP3-Tech Strix Halo design this tool targets")
+
+    method_ok = hw.wmi_device_present(hw.WMI_METHOD_GUID)
+    add("WMI method device", hw.WMI_METHOD_GUID, method_ok)
+
+    notify_id = hw.wmi_notify_id(hw.WMI_EVENT_GUID)
+    add("button notify id", f"0x{notify_id:02X}" if notify_id is not None else "unknown",
+        None if notify_id is None else notify_id == hw.WMI_BUTTON_NOTIFY_ID)
+
+    for marker in ("IP3POWERSWITCH", "AMW0", "FCMO"):
+        present = hw.dsdt_contains(marker)
+        if present is None:
+            add(f"DSDT '{marker}'", "unreadable (needs root)", None)
+        else:
+            add(f"DSDT '{marker}'", "present" if present else "absent", present)
+
+    lines.append("")
+    lines.append("Embedded controller")
+    loaded = hw.ec_sys_loaded()
+    add("ec_sys module", "loaded" if loaded else "not loaded", loaded)
+    if not loaded:
+        problems.append("modprobe ec_sys  (or reboot, once the installer has "
+                        "set up modules-load.d)")
+
+    io_ok = hw.ec_io_available()
+    add(hw.EC_DEBUGFS_PATH, "present" if io_ok else "missing", io_ok)
+
+    write_ok = hw.ec_write_support()
+    if write_ok is None:
+        add("write_support", "unknown (ec_sys not loaded)", None)
+    else:
+        add("write_support", "yes" if write_ok else "no", write_ok)
+        if not write_ok:
+            problems.append("to switch modes, load ec_sys with "
+                            "write_support=1 (see README)")
+
+    if io_ok:
+        try:
+            index = hw.read_mode()
+            add("current mode", f"{index} ({hw.mode_from_index(index).name})"
+                if index is not None and index in hw.MODES_BY_INDEX
+                else str(index), index is not None)
+        except hw.EcAccessError as exc:
+            add("current mode", str(exc), False)
+            problems.append("reading the EC failed -- run this as root")
+    else:
+        add("current mode", "unavailable", None)
+
+    lines.append("")
+    lines.append("ACPI event feed")
+    listener = hw.open_acpi_event_listener(timeout=1.0)
+    if listener is None:
+        add("acpi_event netlink", "unavailable", False)
+        problems.append("no ACPI netlink listener; the daemon will fall back "
+                        "to polling (still functional)")
+    else:
+        add("acpi_event netlink", "subscribed", True)
+        try:
+            hw.read_acpi_events(listener)
+        finally:
+            listener.close()
+
+    lines.append("")
+    lines.append("Desktop integration")
+    add("powerprofilesctl", shutil.which("powerprofilesctl") or "not installed",
+        shutil.which("powerprofilesctl") is not None)
+    add("notify-send", shutil.which("notify-send") or "not installed",
+        shutil.which("notify-send") is not None)
+    # busctl is the fallback transport, so its absence is worth noting but not
+    # fatal as long as notify-send itself works.
+    add("busctl (fallback)", shutil.which("busctl") or "not installed", None)
+
+    user = hw.find_session_user()
+    add("session user", user.pw_name if user else "not found", user is not None)
+    if user is None:
+        problems.append("no graphical session user detected; set "
+                        "'user = <name>' in /etc/evo-x2-linux-osd.conf")
+
+    published = hw.read_state_file()
+    add("daemon state file",
+        f"{published} (published)" if published is not None else "not present",
+        published is not None)
+    if published is None:
+        problems.append("the daemon has not published a mode; is "
+                        "evo-x2-thermal-osd running?")
+
+    print("\n".join(lines))
+    print()
+    if problems:
+        print("Things to look at:")
+        for item in problems:
+            print(f"  - {item}")
+        return 1
+    print("Everything looks good.")
+    return 0
+
+
+def _cmdline_value(label: str, path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return f"unknown ({label})"
+
+
+def _version() -> str:
+    here = os.path.dirname(os.path.realpath(__file__))
+    for candidate in (os.path.join(here, os.pardir, "VERSION"),
+                      os.path.join(here, "VERSION")):
+        try:
+            with open(candidate, "r", encoding="utf-8") as fh:
+                return "v" + fh.read().strip()
+        except OSError:
+            continue
+    return ""
+
+
+# ---------------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Read or change the thermal mode of IP3-Tech Strix Halo "
+                    "mini-PCs (GMKtec EVO-X2 and friends) from Linux.",
+        epilog="Modes: " + ", ".join(m.key for m in hw.MODES)
+               + ", or the index 0-3.",
+    )
+    parser.add_argument("mode", nargs="?", help="mode to switch to")
+    parser.add_argument("--list", action="store_true", help="list the modes")
+    parser.add_argument("--check", action="store_true",
+                        help="print hardware/driver diagnostics")
+    parser.add_argument("--json", action="store_true",
+                        help="print the status as JSON")
+    parser.add_argument("--value", action="store_true",
+                        help="print only the mode index (for scripts and bars)")
+    parser.add_argument("--no-color", action="store_true",
+                        help="disable coloured output")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="skip the confirmation for undocumented modes")
+    args = parser.parse_args(argv)
+
+    if args.no_color:
+        os.environ["NO_COLOR"] = "1"
+
+    if args.check:
+        return cmd_check()
+    if args.list:
+        return cmd_list()
+    if args.mode is not None:
+        return cmd_set(args.mode, yes=args.yes)
+    return cmd_status(as_json=args.json, short=args.value)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

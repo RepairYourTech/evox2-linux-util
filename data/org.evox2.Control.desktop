@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+
+# The file name must match APP_ID in gui/evo-x2-control: a Wayland compositor
+# derives the window's app_id from it, and that is how the task manager finds
+# the icon and groups the window.
+Name=Thermal Mode
+GenericName=Power Profile
+Comment=Switch and monitor the GMKtec EVO-X2 thermal modes
+Exec=evo-x2-control
+Icon=evo-x2-control
+
+Terminal=false
+StartupNotify=true
+StartupWMClass=org.evox2.Control
+
+# Settings only, not System too: listing two main categories makes some menus
+# show the entry twice (desktop-file-validate warns about it).  HardwareSettings
+# is an Additional category under Settings, which is why Settings is listed.
+Categories=Settings;HardwareSettings;
+
+Keywords=thermal;power;performance;quiet;balanced;fan;tdp;profile;gmktec;evo-x2;strix;halo;

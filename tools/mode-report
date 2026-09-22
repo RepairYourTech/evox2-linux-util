@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+mode-report -- show what the thermal modes actually do.
+
+The notification tells you the embedded controller changed mode.  This tells you
+whether the *machine* behaved differently as a result: package power, CPU
+temperature, average clock speed and the OS-side power profile, sampled per mode.
+
+    sudo mode-report                    snapshot the current state
+    sudo mode-report --sample 10        average the readings over 10 seconds
+    sudo mode-report --compare          cycle the three button modes and compare
+    sudo mode-report --compare --load 15    ... with a fixed CPU load applied
+    sudo mode-report --compare --all    also include the undocumented 4th mode
+
+Switching modes writes to the embedded controller and needs root.  --compare
+temporarily changes your thermal mode and puts it back afterwards, and the
+running daemon will show its usual on-screen display for each step.
+
+Note that Quiet/Performance change both the EC (fan curves, power limits) and,
+because the daemon mirrors them, the OS power profile.  This reports hardware
+readings, which is the part the EC controls directly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import multiprocessing
+import os
+import statistics
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                os.pardir, "lib"))
+
+import evo_x2_hw as hw  # noqa: E402
+from evo_x2_metrics import Metrics  # noqa: E402
+
+PROG = "mode-report"
+
+
+# ---------------------------------------------------------------------------
+# Sampling
+# ---------------------------------------------------------------------------
+
+def _burn(stop) -> None:
+    """A CPU-bound worker that stops when `stop` flips."""
+    accumulator = 0
+    while not stop.value:
+        for i in range(100_000):
+            accumulator = (accumulator * 31 + i) & 0xFFFFFFFF
+        if accumulator == -1:      # never true; keeps the loop honest
+            break
+
+
+def start_load(workers: int):
+    stop = multiprocessing.Value("i", 0)
+    processes = []
+    for _ in range(workers):
+        proc = multiprocessing.Process(target=_burn, args=(stop,), daemon=True)
+        proc.start()
+        processes.append(proc)
+    return stop, processes
+
+
+def stop_load(stop, processes) -> None:
+    stop.value = 1
+    for proc in processes:
+        proc.join(timeout=2)
+        if proc.is_alive():
+            proc.terminate()
+
+
+class Sample:
+    __slots__ = ("clock", "temp", "power")
+
+    def __init__(self):
+        self.clock: list = []
+        self.temp: list = []
+        self.power: list = []
+
+    def add(self, observables: Metrics) -> None:
+        for bucket, value in ((self.clock, observables.clock_mhz()),
+                              (self.temp, observables.temperature()),
+                              (self.power, observables.power())):
+            if value is not None:
+                bucket.append(value)
+
+    def summary(self, bucket: list, unit: str, precision: int = 2) -> str:
+        if not bucket:
+            return "-"
+        if len(bucket) == 1:
+            return f"{bucket[0]:.{precision}f} {unit}"
+        return (f"{min(bucket):.{precision}f}/"
+                f"{statistics.fmean(bucket):.{precision}f}/"
+                f"{max(bucket):.{precision}f} {unit}")
+
+
+def take_sample(observables: Metrics, seconds: float, interval: float = 0.25) -> Sample:
+    sample = Sample()
+    deadline = time.monotonic() + seconds
+    while True:
+        sample.add(observables)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+    return sample
+
+
+def cool_down(observables: Metrics, target: float, timeout: float) -> float:
+    """Wait for the package to shed its heat before the next measurement.
+
+    Without this, back-to-back mode changes measure the *previous* mode's
+    thermal debt rather than the new mode: the first run heats the die, and the
+    next one starts throttled.  That produced a comparison where Performance
+    looked cooler and slower than Balanced purely because it ran third.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        temperature = observables.temperature()
+        if temperature is not None and temperature <= target:
+            return temperature
+        time.sleep(1.0)
+    current = observables.temperature()
+    return current if current is not None else float("nan")
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def print_snapshot(observables: Metrics, seconds: float, load: int) -> int:
+    mode = observables.mode_index()
+    if mode is None:
+        print(f"{PROG}: cannot read the EC; run as root and make sure ec_sys is "
+              f"loaded", file=sys.stderr)
+        return 1
+    try:
+        name = hw.mode_from_index(mode).name
+    except hw.ModeError:
+        name = f"unknown ({mode})"
+
+    stop = processes = None
+    if load:
+        stop, processes = start_load(load)
+    try:
+        print(f"Sampling for {seconds:.0f}s"
+              + (f" under {load} CPU-bound workers..." if load else "..."))
+        sample = take_sample(observables, seconds)
+    finally:
+        if stop is not None:
+            stop_load(stop, processes)
+
+    print()
+    print(f"  EC thermal mode   : {name} ({mode})   <- what the hardware is set to")
+    print(f"  powerprofiles-daemon: {observables.ppd_profile() or '-'}")
+    print(f"  CPUfreq governor  : {observables.governor() or '-'}")
+    print(f"  energy_perf_pref  : {observables.epp() or '-'}")
+    print(f"  mean clock        : {sample.summary(sample.clock, 'MHz', 0)}")
+    print(f"  k10temp Tctl      : {sample.summary(sample.temp, 'C')}")
+    print(f"  package power     : {sample.summary(sample.power, 'W')}"
+          + ("   (amdgpu PPT)" if observables.package_power else ""))
+    return 0
+
+
+def print_comparison(observables: Metrics, seconds: float, load: int,
+                     include_all: bool, settle: float,
+                     settle_temp: float, reverse: bool = False) -> int:
+    start_mode = observables.mode_index()
+    if start_mode is None:
+        print(f"{PROG}: cannot read the EC; run as root and make sure ec_sys is "
+              f"loaded", file=sys.stderr)
+        return 1
+
+    modes = [m for m in hw.MODES if m.documented or include_all]
+    if reverse:
+        modes.reverse()
+
+    rows: list = []
+
+    def measure(mode):
+        """Cool down, switch, warm up, and sample one mode.
+
+        The artificial load runs only for this mode's own ramp and sample, and
+        is stopped before the next cooldown.  Leaving it running throughout
+        makes the cooldown impossible to reach, which is what produced the
+        first, meaningless "Performance is cooler than Balanced" result.
+        """
+        start_temp = cool_down(observables, settle_temp, settle)
+        print(f"  -> {mode.name} (starting from {start_temp:.1f} C)", flush=True)
+        hw.write_mode(mode)
+        # Give the EC a moment to commit; clocks and fans lag a mode change.
+        for _ in range(40):
+            time.sleep(0.05)
+            try:
+                if hw.read_mode() == mode.index:
+                    break
+            except hw.EcAccessError:
+                break
+
+        stop = processes = None
+        try:
+            if load:
+                # Warm up for as long as we measure, so every mode is sampled at
+                # a comparable point on its own thermal curve.
+                stop, processes = start_load(load)
+                time.sleep(seconds)
+            else:
+                time.sleep(1.5)
+            return start_temp, take_sample(observables, seconds)
+        finally:
+            if stop is not None:
+                stop_load(stop, processes)
+
+    try:
+        for mode in modes:
+            _start_temp, sample = measure(mode)
+            rows.append((mode,
+                         observables.ppd_profile(),
+                         sample,
+                         observables.epp()))
+    finally:
+        # Always leave the machine in the mode it started in.
+        try:
+            hw.write_mode(hw.mode_from_index(start_mode))
+            print(f"  restored {hw.mode_from_index(start_mode).name}")
+        except (hw.EcAccessError, hw.ModeError):
+            print(f"  WARNING: could not restore the original mode "
+                  f"({start_mode})", file=sys.stderr)
+
+    columns = ["mode", "os profile", "epp", "clock min/avg/max",
+               "Tctl min/avg/max", "power min/avg/max"]
+    table = [
+        [mode.name,
+         profile or "-",
+         epp or "-",
+         sample.summary(sample.clock, "MHz", 0),
+         sample.summary(sample.temp, "C", 1),
+         sample.summary(sample.power, "W", 1)]
+        for mode, profile, sample, epp in rows
+    ]
+
+    print()
+    if load:
+        print(f"  Under a fixed load of {load} CPU-bound workers, "
+              f"{seconds:.0f}s per mode:")
+    else:
+        print(f"  Idle, {seconds:.0f}s per mode:")
+    print()
+
+    widths = [max(len(columns[i]), *(len(row[i]) for row in table))
+              for i in range(len(columns))] if table else [len(c) for c in columns]
+    for index, row in enumerate([columns] + table):
+        print("  " + "  ".join(row[i].ljust(widths[i]) for i in range(len(row))))
+        if index == 0:
+            print("  " + "  ".join("-" * width for width in widths))
+
+    print()
+    print("  What to look for: the modes should differ from each other.  At idle the "
+          "clock and\n  power columns normally climb from Quiet to Performance.  "
+          "Under load the ranking\n  is whatever this firmware implements, so read "
+          "the numbers rather than assume --\n  check that a surprising result "
+          "survives --reverse on a rerun, which rules out\n  an ordering artifact.")
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Sample package power, temperature and clock per thermal mode.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  sudo mode-report\n"
+               "  sudo mode-report --sample 10\n"
+               "  sudo mode-report --compare --load 15\n",
+    )
+    parser.add_argument("--sample", type=float, default=5.0, metavar="SECONDS",
+                        help="how long to average each reading (default: 5)")
+    parser.add_argument("--compare", action="store_true",
+                        help="cycle the modes, sample each, then restore")
+    parser.add_argument("--load", type=int, default=0, metavar="WORKERS",
+                        help="run this many CPU-bound workers while sampling")
+    parser.add_argument("--all", action="store_true",
+                        help="with --compare, also include the undocumented "
+                             "Sustained mode")
+    parser.add_argument("--settle", type=float, default=30.0, metavar="SECONDS",
+                        help="with --compare, wait up to this long between modes "
+                             "for the package to cool (default: 30)")
+    parser.add_argument("--settle-temp", type=float, default=60.0, metavar="C",
+                        help="temperature --settle waits for (default: 60)")
+    parser.add_argument("--reverse", action="store_true",
+                        help="with --compare, test the modes in reverse order; "
+                             "use this to check that a surprising result is not "
+                             "just an ordering artifact")
+    args = parser.parse_args(argv)
+
+    if os.geteuid() != 0:
+        print(f"{PROG}: switching modes and reading the EC need root; "
+              f"run with sudo", file=sys.stderr)
+        return 1
+    if not hw.ec_io_available():
+        print(f"{PROG}: {hw.EC_DEBUGFS_PATH} is unavailable; run: "
+              f"sudo modprobe ec_sys", file=sys.stderr)
+        return 1
+    if args.sample <= 0:
+        parser.error("--sample must be greater than zero")
+
+    observables = Metrics()
+    try:
+        if args.compare:
+            return print_comparison(observables, args.sample, args.load, args.all,
+                                    args.settle, args.settle_temp, args.reverse)
+        return print_snapshot(observables, args.sample, args.load)
+    except hw.EcAccessError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+<!--
+  Unknown: a dashed ring, i.e. indeterminate.  Shown when the mode cannot be read
+  at all (EC missing, daemon not running, permission denied).  Neutral grey so it
+  never reads as one of the four modes.
+
+  See evo-x2-quiet.svg for why there is no `currentColor` and how the colour was
+  chosen.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <circle cx="8" cy="8" r="5" fill="none" stroke="#7c828b" stroke-width="1.6"
+          stroke-dasharray="3 2.2" stroke-linecap="round"/>
+</svg>
