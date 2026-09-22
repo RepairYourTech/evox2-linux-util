@@ -361,7 +361,11 @@ else
 ${SESSION_USER} ALL=(root) NOPASSWD: ${PREFIX}/bin/evo-x2-power, ${BIN_LINK}
 EOF
             if visudo -cf "$tmp" >/dev/null 2>&1; then
-                install -m 0440 -o root -g root "$tmp" "$SUDOERS_PATH"
+                # run, not a bare install: --dry-run is allowed without root, so
+                # this is the one command in the script that could otherwise
+                # rewrite /etc/sudoers.d during a run that promised to change
+                # nothing.
+                run install -m 0440 -o root -g root "$tmp" "$SUDOERS_PATH"
                 rm -f "$tmp"
                 ok "'sudo evo-x2-power <mode>' will not prompt for a password"
             else
